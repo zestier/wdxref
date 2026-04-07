@@ -6,17 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/goccy/go-json"
 
 	"github.com/ekeid/ekeid/internal/store"
 )
 
-// buildTestEntityJSON constructs a Wikidata API-format entity JSON for testing.
-// Each property is given datatype "external-id" so extractExternalIDs picks it up.
+// buildTestEntityJSON constructs a bare Wikidata entity JSON object for
+// testing. Each property is given datatype "external-id" so extractExternalIDs
+// picks it up. Returns the entity object directly (no API wrapper).
 func buildTestEntityJSON(qid, label string, properties map[string]string) []byte {
 	claims := make(map[string]interface{})
 	for propID, value := range properties {
@@ -34,17 +37,26 @@ func buildTestEntityJSON(qid, label string, properties map[string]string) []byte
 	}
 
 	entity := map[string]interface{}{
-		"entities": map[string]interface{}{
-			qid: map[string]interface{}{
-				"labels": map[string]interface{}{
-					"en": map[string]string{"value": label},
-				},
-				"claims": claims,
-			},
+		"id": qid,
+		"labels": map[string]interface{}{
+			"en": map[string]string{"value": label},
 		},
+		"claims": claims,
 	}
 
 	data, _ := json.Marshal(entity)
+	return data
+}
+
+// buildTestAPIResponse wraps one or more bare entity objects in the
+// wbgetentities response envelope {"entities":{...}}.
+func buildTestAPIResponse(entities map[string][]byte) []byte {
+	inner := make(map[string]json.RawMessage, len(entities))
+	for qid, data := range entities {
+		inner[qid] = json.RawMessage(data)
+	}
+	resp := map[string]interface{}{"entities": inner}
+	data, _ := json.Marshal(resp)
 	return data
 }
 
@@ -56,7 +68,7 @@ func TestParseEntityJSON_Movie(t *testing.T) {
 		"P8013": "the-shawshank-redemption",
 	})
 
-	entity, err := ParseEntityJSON("Q172241", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
@@ -67,17 +79,17 @@ func TestParseEntityJSON_Movie(t *testing.T) {
 	if entity.ID != "Q172241" {
 		t.Errorf("ID = %q, want Q172241", entity.ID)
 	}
-	if v := entity.ExternalIDs[345]; len(v) != 1 || v[0] != "tt0111161" {
-		t.Errorf("P345 = %v, want [tt0111161]", v)
+	if !slices.Contains(entity.Mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[4947]; len(v) != 1 || v[0] != "278" {
-		t.Errorf("P4947 = %v, want [278]", v)
+	if !slices.Contains(entity.Mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[4835]; len(v) != 1 || v[0] != "2095" {
-		t.Errorf("P4835 = %v, want [2095]", v)
+	if !slices.Contains(entity.Mappings, "P4835:2095") {
+		t.Errorf("expected P4835:2095 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[8013]; len(v) != 1 || v[0] != "the-shawshank-redemption" {
-		t.Errorf("P8013 = %v, want [the-shawshank-redemption]", v)
+	if !slices.Contains(entity.Mappings, "P8013:the-shawshank-redemption") {
+		t.Errorf("expected P8013:the-shawshank-redemption in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -90,7 +102,7 @@ func TestParseEntityJSON_TVSeries(t *testing.T) {
 		"P8013": "breaking-bad",
 	})
 
-	entity, err := ParseEntityJSON("Q1079", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
@@ -98,35 +110,32 @@ func TestParseEntityJSON_TVSeries(t *testing.T) {
 		t.Fatal("expected entity, got nil")
 	}
 
-	if len(entity.ExternalIDs) != 5 {
-		t.Errorf("len(ExternalIDs) = %d, want 5", len(entity.ExternalIDs))
+	if len(entity.Mappings) != 5 {
+		t.Errorf("len(Mappings) = %d, want 5", len(entity.Mappings))
 	}
-	if v := entity.ExternalIDs[345]; len(v) != 1 || v[0] != "tt0903747" {
-		t.Errorf("P345 = %v, want [tt0903747]", v)
+	if !slices.Contains(entity.Mappings, "P345:tt0903747") {
+		t.Errorf("expected P345:tt0903747 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[4983]; len(v) != 1 || v[0] != "1396" {
-		t.Errorf("P4983 = %v, want [1396]", v)
+	if !slices.Contains(entity.Mappings, "P4983:1396") {
+		t.Errorf("expected P4983:1396 in mappings, got %v", entity.Mappings)
 	}
 }
 
 func TestParseEntityJSON_NoExternalIDs(t *testing.T) {
-	// Entity with no external-id claims should return nil
+	// Entity with no external-id claims should return entity with empty mappings.
 	entity := map[string]interface{}{
-		"entities": map[string]interface{}{
-			"Q42": map[string]interface{}{
-				"labels": map[string]interface{}{
-					"en": map[string]string{"value": "Douglas Adams"},
-				},
-				"claims": map[string]interface{}{
-					"P31": []map[string]interface{}{
-						{
-							"mainsnak": map[string]interface{}{
-								"datatype": "wikibase-item",
-								"datavalue": map[string]interface{}{
-									"value": map[string]string{"id": "Q5"},
-									"type":  "wikibase-entityid",
-								},
-							},
+		"id": "Q42",
+		"labels": map[string]interface{}{
+			"en": map[string]string{"value": "Douglas Adams"},
+		},
+		"claims": map[string]interface{}{
+			"P31": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype": "wikibase-item",
+						"datavalue": map[string]interface{}{
+							"value": map[string]string{"id": "Q5"},
+							"type":  "wikibase-entityid",
 						},
 					},
 				},
@@ -135,12 +144,31 @@ func TestParseEntityJSON_NoExternalIDs(t *testing.T) {
 	}
 	data, _ := json.Marshal(entity)
 
-	result, err := ParseEntityJSON("Q42", data)
+	result, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
-	if result != nil {
-		t.Errorf("expected nil for entity with no external IDs, got %+v", result)
+	if result == nil {
+		t.Fatal("expected non-nil entity with empty mappings, got nil")
+	}
+	if result.ID != "Q42" {
+		t.Errorf("ID = %q, want Q42", result.ID)
+	}
+	if len(result.Mappings) != 0 {
+		t.Errorf("expected empty mappings, got %v", result.Mappings)
+	}
+	if result.Mappings == nil {
+		t.Error("Mappings should be non-nil empty slice, got nil")
+	}
+}
+
+func TestExtractExternalIDs_NoClaims(t *testing.T) {
+	result := extractExternalIDs(nil)
+	if result == nil {
+		t.Fatal("expected non-nil empty slice, got nil")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected empty slice, got %v", result)
 	}
 }
 
@@ -149,15 +177,15 @@ func TestParseEntityJSON_SingleID(t *testing.T) {
 		"P345": "tt9999999",
 	})
 
-	entity, err := ParseEntityJSON("Q999", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity with 1 ID, got nil")
 	}
-	if v := entity.ExternalIDs[345]; len(v) != 1 || v[0] != "tt9999999" {
-		t.Errorf("P345 = %v, want [tt9999999]", v)
+	if !slices.Contains(entity.Mappings, "P345:tt9999999") {
+		t.Errorf("expected P345:tt9999999 in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -168,21 +196,21 @@ func TestParseEntityJSON_VideoGame(t *testing.T) {
 		"P1933": "50538",
 	})
 
-	entity, err := ParseEntityJSON("Q47740", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity, got nil")
 	}
-	if v := entity.ExternalIDs[1733]; len(v) != 1 || v[0] != "620" {
-		t.Errorf("P1733 = %v, want [620]", v)
+	if !slices.Contains(entity.Mappings, "P1733:620") {
+		t.Errorf("expected P1733:620 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[5794]; len(v) != 1 || v[0] != "72" {
-		t.Errorf("P5794 = %v, want [72]", v)
+	if !slices.Contains(entity.Mappings, "P5794:72") {
+		t.Errorf("expected P5794:72 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[1933]; len(v) != 1 || v[0] != "50538" {
-		t.Errorf("P1933 = %v, want [50538]", v)
+	if !slices.Contains(entity.Mappings, "P1933:50538") {
+		t.Errorf("expected P1933:50538 in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -192,18 +220,18 @@ func TestParseEntityJSON_Person(t *testing.T) {
 		"P4985": "42",
 	})
 
-	entity, err := ParseEntityJSON("Q42", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity, got nil")
 	}
-	if v := entity.ExternalIDs[345]; len(v) != 1 || v[0] != "nm0010930" {
-		t.Errorf("P345 = %v, want [nm0010930]", v)
+	if !slices.Contains(entity.Mappings, "P345:nm0010930") {
+		t.Errorf("expected P345:nm0010930 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[4985]; len(v) != 1 || v[0] != "42" {
-		t.Errorf("P4985 = %v, want [42]", v)
+	if !slices.Contains(entity.Mappings, "P4985:42") {
+		t.Errorf("expected P4985:42 in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -214,18 +242,18 @@ func TestParseEntityJSON_Book(t *testing.T) {
 		"P2969": "72193",
 	})
 
-	entity, err := ParseEntityJSON("Q8337", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity, got nil")
 	}
-	if v := entity.ExternalIDs[212]; len(v) != 1 || v[0] != "978-0747532743" {
-		t.Errorf("P212 = %v, want [978-0747532743]", v)
+	if !slices.Contains(entity.Mappings, "P212:978-0747532743") {
+		t.Errorf("expected P212:978-0747532743 in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[648]; len(v) != 1 || v[0] != "OL82563W" {
-		t.Errorf("P648 = %v, want [OL82563W]", v)
+	if !slices.Contains(entity.Mappings, "P648:OL82563W") {
+		t.Errorf("expected P648:OL82563W in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -235,18 +263,18 @@ func TestParseEntityJSON_MusicGroup(t *testing.T) {
 		"P1902": "4Z8W4fKeB5YxbusRsdQVPb",
 	})
 
-	entity, err := ParseEntityJSON("Q11036", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity, got nil")
 	}
-	if v := entity.ExternalIDs[434]; len(v) != 1 || v[0] != "a74b1b7f-71a5-4011-9441-d0b5e4122711" {
-		t.Errorf("P434 = %v, want [UUID]", v)
+	if !slices.Contains(entity.Mappings, "P434:a74b1b7f-71a5-4011-9441-d0b5e4122711") {
+		t.Errorf("expected P434:UUID in mappings, got %v", entity.Mappings)
 	}
-	if v := entity.ExternalIDs[1902]; len(v) != 1 || v[0] != "4Z8W4fKeB5YxbusRsdQVPb" {
-		t.Errorf("P1902 = %v, want [4Z8W4fKeB5YxbusRsdQVPb]", v)
+	if !slices.Contains(entity.Mappings, "P1902:4Z8W4fKeB5YxbusRsdQVPb") {
+		t.Errorf("expected P1902:4Z8W4fKeB5YxbusRsdQVPb in mappings, got %v", entity.Mappings)
 	}
 }
 
@@ -255,182 +283,39 @@ func TestParseEntityJSON_MusicAlbum(t *testing.T) {
 		"P436": "b1392450-e666-3926-a536-22c65f834433",
 	})
 
-	entity, err := ParseEntityJSON("Q190588", data)
+	entity, err := ParseEntityJSON(data)
 	if err != nil {
 		t.Fatalf("ParseEntityJSON: %v", err)
 	}
 	if entity == nil {
 		t.Fatal("expected entity, got nil")
 	}
-	if v := entity.ExternalIDs[436]; len(v) != 1 || v[0] != "b1392450-e666-3926-a536-22c65f834433" {
-		t.Errorf("P436 = %v, want [UUID]", v)
+	if !slices.Contains(entity.Mappings, "P436:b1392450-e666-3926-a536-22c65f834433") {
+		t.Errorf("expected P436:UUID in mappings, got %v", entity.Mappings)
 	}
 }
 
 func TestParseEntityJSON_InvalidJSON(t *testing.T) {
-	_, err := ParseEntityJSON("Q1", []byte("not valid json"))
+	_, err := ParseEntityJSON([]byte("not valid json"))
 	if err == nil {
 		t.Error("expected error for invalid JSON")
 	}
 }
 
-// buildTestEntityJSONWithModified constructs a Wikidata API-format entity JSON
-// with a custom modified field (simulating wbgetentities with props=claims|info).
-func buildTestEntityJSONWithModified(qid string, properties map[string]string, modified string) []byte {
-	claims := make(map[string]interface{})
-	for propID, value := range properties {
-		claims[propID] = []map[string]interface{}{
-			{
-				"mainsnak": map[string]interface{}{
-					"datatype": "external-id",
-					"datavalue": map[string]interface{}{
-						"value": value,
-						"type":  "string",
-					},
-				},
-			},
-		}
-	}
-
-	entityFields := map[string]interface{}{
-		"labels": map[string]interface{}{
-			"en": map[string]string{"value": "Test"},
-		},
-		"claims": claims,
-	}
-	if modified != "" {
-		entityFields["modified"] = modified
-	}
-
-	entity := map[string]interface{}{
-		"entities": map[string]interface{}{
-			qid: entityFields,
-		},
-	}
-
-	data, _ := json.Marshal(entity)
-	return data
-}
-
-// TestParseEntityJSON_ExtractsModified verifies the modified field from
-// the wbgetentities API response (requires props=info).
-func TestParseEntityJSON_ExtractsModified(t *testing.T) {
-	data := buildTestEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "2026-05-15T14:30:00Z")
-
-	entity, err := ParseEntityJSON("Q1", data)
-	if err != nil {
-		t.Fatalf("ParseEntityJSON: %v", err)
-	}
-	if entity == nil {
-		t.Fatal("expected non-nil entity")
-	}
-	expected := time.Date(2026, 5, 15, 14, 30, 0, 0, time.UTC)
-	if !entity.Modified.Equal(expected) {
-		t.Errorf("Modified = %v, want %v", entity.Modified, expected)
-	}
-}
-
-// TestParseEntityJSON_MissingModified verifies zero time when no modified field.
-func TestParseEntityJSON_MissingModified(t *testing.T) {
-	// buildTestEntityJSON does not include modified
-	data := buildTestEntityJSON("Q1", "Test", map[string]string{"P345": "tt1"})
-
-	entity, err := ParseEntityJSON("Q1", data)
-	if err != nil {
-		t.Fatalf("ParseEntityJSON: %v", err)
-	}
-	if entity == nil {
-		t.Fatal("expected non-nil entity")
-	}
-	if !entity.Modified.IsZero() {
-		t.Errorf("Modified = %v, want zero time (no modified field)", entity.Modified)
-	}
-}
-
-// TestProcessorPropagatesModified verifies that ProcessEntities propagates
-// the modified timestamp from the API response to the entity record.
-func TestProcessorPropagatesModified(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-	writer, err := store.NewWriter(dbPath)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	defer writer.Close()
-
-	if err := writer.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema: %v", err)
-	}
-
-	modified := "2026-05-20T10:00:00Z"
-	entityJSON := buildTestEntityJSONWithModified("Q42", map[string]string{"P345": "nm0010930"}, modified)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(entityJSON)
-	}))
-	defer server.Close()
-
-	client := NewWikidataClient(server.Client())
-	client.baseURL = server.URL
-
-	processor := NewProcessor(writer, client)
-	err = processor.ProcessEntity("Q42")
-	if err != nil {
-		t.Fatalf("ProcessEntity: %v", err)
-	}
-
-	// The entity should survive a sweep at a time before the modified time
-	// (because viewed_at was set from Modified via UpsertEntitiesBatch)
-	reader := store.NewReaderFromDB(writer.DB())
-	result, err := reader.LookupByProperty(345, "nm0010930")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
-	if result == nil {
-		t.Fatal("expected entity to be stored")
-	}
-}
-
-// TestParseEntityJSON_UnparseableModified verifies that an invalid modified
-// date is silently treated as zero time, not an error.
-func TestParseEntityJSON_UnparseableModified(t *testing.T) {
-	data := buildTestEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "garbage-date")
-
-	entity, err := ParseEntityJSON("Q1", data)
-	if err != nil {
-		t.Fatalf("ParseEntityJSON should not error on bad modified: %v", err)
-	}
-	if entity == nil {
-		t.Fatal("expected non-nil entity")
-	}
-	if !entity.Modified.IsZero() {
-		t.Errorf("Modified = %v, want zero time for unparseable date", entity.Modified)
-	}
-}
-
 func TestProcessorWithMockServer(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-	writer, err := store.NewWriter(dbPath)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	defer writer.Close()
+	writer := newTestStoreWriter(t)
 
-	if err := writer.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema: %v", err)
-	}
-
-	entityJSON := buildTestEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
+	entityObj := buildTestEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
 		"P4947": "278",
 		"P4835": "2095",
 	})
 
+	apiResp := buildTestAPIResponse(map[string][]byte{"Q172241": entityObj})
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(entityJSON)
+		w.Write(apiResp)
 	}))
 	defer server.Close()
 
@@ -439,12 +324,12 @@ func TestProcessorWithMockServer(t *testing.T) {
 
 	processor := NewProcessor(writer, client)
 
-	err = processor.ProcessEntity("Q172241")
+	err := processor.ProcessEntity("Q172241")
 	if err != nil {
 		t.Fatalf("ProcessEntity: %v", err)
 	}
 
-	reader := store.NewReaderFromDB(writer.DB())
+	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
@@ -456,8 +341,160 @@ func TestProcessorWithMockServer(t *testing.T) {
 		t.Errorf("WikidataID = %d, want 172241", result.WikidataID)
 	}
 	// Check that TMDB movie mapping is present
-	if v := result.Mappings[4947]; len(v) != 1 || v[0] != "278" {
-		t.Errorf("P4947 mapping = %v, want [278]", v)
+	if !slices.Contains(result.Mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", result.Mappings)
+	}
+}
+
+// TestFetchEntitiesRaw_APIErrorDoesNotDelete verifies that a non-maxlag API
+// error (e.g. readonly, internal-api-error) is returned as a batch error
+// instead of silently marking every entity as missing (which would delete them).
+func TestFetchEntitiesRaw_APIErrorDoesNotDelete(t *testing.T) {
+	apiError := `{"error":{"code":"readonly","info":"The wiki is currently in read-only mode.","docref":"See https://www.wikidata.org/w/api.php for API usage"}}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(apiError))
+	}))
+	defer server.Close()
+
+	client := NewWikidataClient(server.Client())
+	client.baseURL = server.URL
+
+	_, err := client.FetchEntitiesRaw([]string{"Q1", "Q2", "Q3"})
+	if err == nil {
+		t.Fatal("expected error for API error response, got nil")
+	}
+	if strings.Contains(err.Error(), "missing") {
+		t.Errorf("API error should not produce 'missing' error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "readonly") {
+		t.Errorf("expected error to mention 'readonly', got: %v", err)
+	}
+}
+
+// TestFetchEntitiesRaw_EmptyEntitiesReturnsError verifies that a response
+// with an empty entities map returns a batch error instead of marking
+// everything as missing.
+func TestFetchEntitiesRaw_EmptyEntitiesReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"entities":{}}`))
+	}))
+	defer server.Close()
+
+	client := NewWikidataClient(server.Client())
+	client.baseURL = server.URL
+
+	_, err := client.FetchEntitiesRaw([]string{"Q1"})
+	if err == nil {
+		t.Fatal("expected error for empty entities response, got nil")
+	}
+}
+
+// TestProcessEntities_BatchWithMixedResults verifies that a batch where some
+// entities have external IDs and some don't produces the correct mix of
+// upserts (not deletes).
+func TestProcessEntities_BatchWithMixedResults(t *testing.T) {
+	writer := newTestStoreWriter(t)
+
+	// Q1 has external IDs, Q2 has none, Q999 is missing.
+	q1Obj := buildTestEntityJSON("Q1", "Entity with IDs", map[string]string{
+		"P345": "tt1234567",
+	})
+	q2Obj := []byte(`{"id":"Q2","claims":{"P31":[{"mainsnak":{"datatype":"wikibase-item","datavalue":{"value":{"id":"Q5"},"type":"wikibase-entityid"}}}]}}`)
+	q999Obj := []byte(`{"missing":""}`)
+
+	apiResp := buildTestAPIResponse(map[string][]byte{
+		"Q1":   q1Obj,
+		"Q2":   q2Obj,
+		"Q999": q999Obj,
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(apiResp)
+	}))
+	defer server.Close()
+
+	client := NewWikidataClient(server.Client())
+	client.baseURL = server.URL
+	processor := NewProcessor(writer, client)
+
+	perErrors, err := processor.ProcessEntities([]string{"Q1", "Q2", "Q999"})
+	if err != nil {
+		t.Fatalf("ProcessEntities: %v", err)
+	}
+
+	// Q1 should be upserted successfully.
+	if perErrors["Q1"] != nil {
+		t.Errorf("Q1 should succeed, got: %v", perErrors["Q1"])
+	}
+
+	// Q2 should be upserted (with empty mappings), not deleted.
+	if perErrors["Q2"] != nil {
+		t.Errorf("Q2 should succeed, got: %v", perErrors["Q2"])
+	}
+
+	// Q999 should be deleted (missing).
+	if perErrors["Q999"] != nil {
+		t.Errorf("Q999 should succeed (delete), got: %v", perErrors["Q999"])
+	}
+
+	reader := store.NewReaderFromWriter(writer)
+	result, err := reader.LookupByProperty(345, "tt1234567")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Q1 should be stored")
+	}
+}
+
+// TestProcessEntities_AbsentFromResponseIsError verifies that a QID missing
+// from the API response (not returned at all, as opposed to returned with
+// a "missing" key) is treated as a per-entity error, not a delete.
+func TestProcessEntities_AbsentFromResponseIsError(t *testing.T) {
+	writer := newTestStoreWriter(t)
+
+	// Seed Q50 first so we can verify it's NOT deleted.
+	if err := writer.UpsertEntity("Q50", []string{"P345:tt9999999"}); err != nil {
+		t.Fatalf("seed Q50: %v", err)
+	}
+
+	// API response contains Q1 but not Q50 — simulates partial response.
+	q1Obj := buildTestEntityJSON("Q1", "Entity", map[string]string{"P345": "tt1"})
+	apiResp := buildTestAPIResponse(map[string][]byte{"Q1": q1Obj})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(apiResp)
+	}))
+	defer server.Close()
+
+	client := NewWikidataClient(server.Client())
+	client.baseURL = server.URL
+	processor := NewProcessor(writer, client)
+
+	perErrors, err := processor.ProcessEntities([]string{"Q1", "Q50"})
+	if err != nil {
+		t.Fatalf("ProcessEntities: %v", err)
+	}
+
+	// Q50 should be an error, not silently deleted.
+	if perErrors["Q50"] == nil {
+		t.Error("Q50 absent from response should be a per-entity error, not silent success")
+	}
+
+	// Verify Q50 was NOT deleted.
+	reader := store.NewReaderFromWriter(writer)
+	result, err := reader.LookupByProperty(345, "tt9999999")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Q50 should NOT have been deleted")
 	}
 }
 
@@ -467,17 +504,7 @@ func sseEvent(id string, data []byte) string {
 }
 
 func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-	writer, err := store.NewWriter(dbPath)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	defer writer.Close()
-
-	if err := writer.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema: %v", err)
-	}
+	writer := newTestStoreWriter(t)
 
 	// Set last_sync to 30 days ago so the stream can't possibly go back that far.
 	oldDumpTime := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
@@ -509,7 +536,7 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 	esWatcher.streamURL = server.URL
 
 	ctx := context.Background()
-	err = esWatcher.connectAndProcess(ctx)
+	err := esWatcher.connectAndProcess(ctx)
 
 	if !errors.Is(err, ErrStreamTooOld) {
 		t.Fatalf("expected ErrStreamTooOld, got: %v", err)
@@ -526,20 +553,10 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 }
 
 func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-	writer, err := store.NewWriter(dbPath)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	defer writer.Close()
+	writer := newTestStoreWriter(t)
 
-	if err := writer.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema: %v", err)
-	}
-
-	// Set dump_time so that after subtracting the 72h safety offset, sinceTime
-	// lands close to now — well within the 1h stream-gap threshold.
+	// Set dump_time close to now so the requested sinceTime stays well within
+	// the 1h stream-gap threshold.
 	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
 	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
 		t.Fatalf("SetSyncState: %v", err)
@@ -566,7 +583,7 @@ func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
 	esWatcher.streamURL = server.URL
 
 	ctx := context.Background()
-	err = esWatcher.connectAndProcess(ctx)
+	err := esWatcher.connectAndProcess(ctx)
 
 	// Should get "stream ended" (server closed), NOT ErrStreamTooOld.
 	if errors.Is(err, ErrStreamTooOld) {
@@ -574,6 +591,124 @@ func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("expected some error (stream ended), got nil")
+	}
+}
+
+func TestConnectAndProcess_EnqueueFailureReturnsError(t *testing.T) {
+	s := miniredis.RunT(t)
+	c, err := store.NewClient(s.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	writer := store.NewWriter(c)
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
+	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
+		t.Fatalf("SetSyncState: %v", err)
+	}
+
+	closed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		if !closed {
+			closed = true
+			s.Close()
+		}
+
+		for i := 1; i <= enqueueBatchSize; i++ {
+			eventData, _ := json.Marshal(map[string]interface{}{
+				"meta":      map[string]string{"domain": "www.wikidata.org"},
+				"wiki":      "wikidatawiki",
+				"namespace": 0,
+				"title":     fmt.Sprintf("Q%d", i),
+				"timestamp": time.Now().Unix(),
+			})
+			fmt.Fprint(w, sseEvent(fmt.Sprintf("evt%d", i), eventData))
+		}
+	}))
+	defer server.Close()
+
+	processor := NewProcessor(writer, nil)
+	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher.streamURL = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = esWatcher.connectAndProcess(ctx)
+	if err == nil {
+		t.Fatal("expected enqueue writer error, got nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("connectAndProcess timed out instead of returning enqueue error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "enqueue writer:") {
+		t.Fatalf("expected enqueue writer error, got: %v", err)
+	}
+}
+
+func TestConnectAndProcess_FinalEnqueueFlushFailureReturnsError(t *testing.T) {
+	s := miniredis.RunT(t)
+	c, err := store.NewClient(s.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	writer := store.NewWriter(c)
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
+	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
+		t.Fatalf("SetSyncState: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		eventData, _ := json.Marshal(map[string]interface{}{
+			"meta":      map[string]string{"domain": "www.wikidata.org"},
+			"wiki":      "wikidatawiki",
+			"namespace": 0,
+			"title":     "Q1",
+			"timestamp": time.Now().Unix(),
+		})
+		fmt.Fprint(w, sseEvent("evt1", eventData))
+
+		// Force the only enqueue flush to happen during the deferred close path.
+		s.Close()
+	}))
+	defer server.Close()
+
+	processor := NewProcessor(writer, nil)
+	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher.streamURL = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = esWatcher.connectAndProcess(ctx)
+	if err == nil {
+		t.Fatal("expected enqueue writer error, got nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("connectAndProcess timed out instead of returning enqueue error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "enqueue writer:") {
+		t.Fatalf("expected enqueue writer error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "stream ended") {
+		t.Fatalf("expected deferred flush error to win over stream ended, got: %v", err)
 	}
 }
 

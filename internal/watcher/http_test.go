@@ -16,9 +16,9 @@ func TestThrottleTransportRateLimit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Use a rate of 2/sec so we can measure timing without the test being slow.
+	// Use a rate of 20/sec so the test stays fast while still observing waits.
 	tt := &ThrottleTransport{
-		limiter: rate.NewLimiter(rate.Limit(2), 1),
+		limiter: rate.NewLimiter(rate.Limit(20), 1),
 		base:    server.Client().Transport,
 	}
 	client := &http.Client{Transport: tt}
@@ -38,24 +38,26 @@ func TestThrottleTransportRateLimit(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	// 5 requests at 2/sec with burst=1: first fires immediately, then 4 waits
-	// of 500ms each = ~2s minimum.
-	if elapsed < 1500*time.Millisecond {
-		t.Errorf("5 requests at rate=2/sec completed in %v, expected ≥1.5s", elapsed)
+	// 5 requests at 20/sec with burst=1: first fires immediately, then 4 waits
+	// of 50ms each = ~200ms minimum.
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("5 requests at rate=20/sec completed in %v, expected ≥150ms", elapsed)
 	}
 }
 
 func TestThrottleTransportExpensiveEndpointCooldown(t *testing.T) {
-	// Server that takes >1s to respond (simulated via sleep).
+	// Server that takes longer than the custom threshold to respond.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(1100 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
 	tt := &ThrottleTransport{
-		limiter: rate.NewLimiter(rate.Limit(100), 1), // high rate so limiter doesn't add delay
-		base:    server.Client().Transport,
+		limiter:            rate.NewLimiter(rate.Limit(100), 1), // high rate so limiter doesn't add delay
+		base:               server.Client().Transport,
+		expensiveThreshold: 10 * time.Millisecond,
+		expensiveCooldown:  30 * time.Millisecond,
 	}
 	client := &http.Client{Transport: tt}
 
@@ -69,9 +71,9 @@ func TestThrottleTransportExpensiveEndpointCooldown(t *testing.T) {
 	resp.Body.Close()
 	firstDuration := time.Since(start)
 
-	// The first request should take at least 1.1s (response) + 5s (cooldown).
-	if firstDuration < 6*time.Second {
-		t.Errorf("expensive request completed in %v, expected ≥6s (1.1s response + 5s cooldown)", firstDuration)
+	// The first request should take at least ~20ms (response) + 30ms (cooldown).
+	if firstDuration < 45*time.Millisecond {
+		t.Errorf("expensive request completed in %v, expected ≥45ms (20ms response + 30ms cooldown)", firstDuration)
 	}
 }
 
@@ -92,7 +94,7 @@ func TestThrottleTransportConcurrency(t *testing.T) {
 		}
 		mu <- struct{}{}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 
 		<-mu
 		concurrent--

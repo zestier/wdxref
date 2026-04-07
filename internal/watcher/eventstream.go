@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -25,11 +25,10 @@ const (
 	reconnectDelay     = 5 * time.Second
 	retryInterval      = 10 * time.Minute
 	retryBatchSize     = 50
-	queuePollInterval  = 15 * time.Second
+	queuePollInterval  = 1 * time.Minute
 	enqueueBatchSize   = 1000            // buffer up to N QIDs before flushing to DB
 	enqueueFlushDelay  = 5 * time.Second // max delay before flushing a partial batch
 	streamGapThreshold = 1 * time.Hour
-	dumpSafetyOffset   = 72 * time.Hour // how far before dump_time to start streaming
 )
 
 // recentChangeEvent represents a Wikidata recent change event.
@@ -71,6 +70,11 @@ func NewEventStreamWatcher(processor *Processor, writer *store.Writer, httpClien
 // goroutine drains the queue in batches via the wbgetentities API.
 // A second background goroutine periodically retries entities from the failed_entity table.
 func (w *EventStreamWatcher) Watch(ctx context.Context) error {
+	// Recover any QIDs left in the processing set from a previous crash.
+	if err := w.writer.RecoverProcessing(); err != nil {
+		return fmt.Errorf("recover processing set: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
@@ -95,7 +99,7 @@ func (w *EventStreamWatcher) Watch(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			log.Printf("EventStream connection error: %v. Reconnecting in %v...", err, reconnectDelay)
+			slog.Error("eventstream connection error, reconnecting", "error", err, "delay", reconnectDelay)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -105,13 +109,18 @@ func (w *EventStreamWatcher) Watch(ctx context.Context) error {
 	}
 }
 
-func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
+func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) (retErr error) {
+	streamCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
 	url := w.streamURL
 
 	// sinceTime is used for the gap check: did the stream return data
-	// going back far enough? We always use ?since= (timestamp) rather
-	// than Last-Event-ID (Kafka offset) because it seems like there can
-	// be gaps if the last event ID is old.
+	// going back far enough? We reconnect with ?since= using the earliest
+	// timestamp embedded in the stored SSE event ID rather than sending the
+	// raw Last-Event-ID back to EventStreams. This intentionally trades exact
+	// cursor replay for a time-based lower bound that we can validate with the
+	// gap check below.
 	var sinceTime time.Time
 
 	lastEventID, err := w.writer.GetSyncState("last_event_id")
@@ -133,7 +142,7 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("parse dump_time: %w", err)
 		}
-		sinceTime = t.Add(-dumpSafetyOffset)
+		sinceTime = t
 	}
 
 	if !sinceTime.IsZero() {
@@ -141,7 +150,7 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 		url = fmt.Sprintf("%s?since=%s", url, since)
 	}
 
-	req, err := newRequestWithContext(ctx, "GET", url)
+	req, err := newRequestWithContext(streamCtx, "GET", url)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -157,7 +166,7 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 		return fmt.Errorf("eventstream returned status %d", resp.StatusCode)
 	}
 
-	log.Println("Connected to EventStreams")
+	slog.Info("connected to EventStreams")
 
 	// Channel for async DB writes.
 	enqueueCh := make(chan struct {
@@ -168,14 +177,20 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// Background writer: receives QIDs, batches them, writes to DB
+	// Background writer: receives QIDs, batches them, writes to DB.
+	// Any enqueue failure is treated as fatal for this stream connection so the
+	// caller reconnects from the last persisted event ID.
 	go func() {
 		defer wg.Done()
 
 		batchSet := make(map[string]struct{}, enqueueBatchSize)
 		batch := make([]string, 0, enqueueBatchSize)
 		var batchLastEventID string
-		flush := func() error {
+		reportErr := func(err error) {
+			cancel(fmt.Errorf("enqueue writer: %w", err))
+			_ = resp.Body.Close()
+		}
+		flushOnce := func() error {
 			if len(batchSet) == 0 {
 				return nil
 			}
@@ -192,11 +207,12 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 					return fmt.Errorf("persist last_event_id: %w", err)
 				}
 			}
-			log.Printf("Enqueued %d entities for processing (%d new)", len(batch), n)
+			slog.Info("enqueued entities", "count", len(batch), "new", n)
 			clear(batchSet)
 			batchLastEventID = ""
 			return nil
 		}
+		flush := flushOnce
 
 		// Flush periodically even if batch not full
 		ticker := time.NewTicker(enqueueFlushDelay)
@@ -207,19 +223,25 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 			case item, ok := <-enqueueCh:
 				if !ok {
 					// Channel closed, flush remaining
-					_ = flush()
+					if err := flush(); err != nil {
+						reportErr(fmt.Errorf("flush remaining enqueue buffer: %w", err))
+					}
 					return
 				}
 				batchSet[item.qid] = struct{}{}
 				batchLastEventID = item.eventID
 				if len(batchSet) >= enqueueBatchSize {
 					if err := flush(); err != nil {
-						log.Printf("Error flushing enqueue buffer: %v", err)
+						slog.Error("error flushing enqueue buffer", "error", err)
+						reportErr(err)
+						return
 					}
 				}
 			case <-ticker.C:
 				if err := flush(); err != nil {
-					log.Printf("Error flushing enqueue buffer: %v", err)
+					slog.Error("error flushing enqueue buffer", "error", err)
+					reportErr(err)
+					return
 				}
 			}
 		}
@@ -229,6 +251,9 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 	defer func() {
 		close(enqueueCh)
 		wg.Wait()
+		if cause := context.Cause(streamCtx); cause != nil && ctx.Err() == nil && !errors.Is(retErr, ErrStreamTooOld) {
+			retErr = cause
+		}
 	}()
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -239,6 +264,9 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if err := context.Cause(streamCtx); err != nil && ctx.Err() == nil {
+			return err
 		}
 
 		line := scanner.Text()
@@ -264,10 +292,9 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 				if !eventTime.IsZero() {
 					gap := eventTime.Sub(sinceTime)
 					if gap > streamGapThreshold {
-						log.Printf("Stream gap detected: requested since %s, first event at %s (gap: %v)",
-							sinceTime.Format(time.RFC3339), eventTime.Format(time.RFC3339), gap)
+						slog.Warn("stream gap detected", "since", sinceTime.Format(time.RFC3339), "first_event", eventTime.Format(time.RFC3339), "gap", gap)
 						if err := w.writer.ClearSyncCursors(); err != nil {
-							log.Printf("Failed to clear sync cursors: %v", err)
+							slog.Error("failed to clear sync cursors", "error", err)
 						}
 						return ErrStreamTooOld
 					}
@@ -280,18 +307,35 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 				continue
 			}
 
-			enqueueCh <- struct {
+			select {
+			case enqueueCh <- struct {
 				qid     string
 				eventID string
-			}{qid: qid, eventID: lastEventID}
+			}{qid: qid, eventID: lastEventID}:
+			case <-streamCtx.Done():
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return context.Cause(streamCtx)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
+		if cause := context.Cause(streamCtx); cause != nil && ctx.Err() == nil {
+			return cause
+		}
 		return fmt.Errorf("scanner error: %w", err)
 	}
 
-	return fmt.Errorf("stream ended")
+	if cause := context.Cause(streamCtx); cause != nil && ctx.Err() == nil {
+		return cause
+	}
+
+	retErr = fmt.Errorf("stream ended")
+	return
 }
 
 // extractEvent parses an SSE data payload and returns the QID if the event
@@ -364,60 +408,136 @@ func (w *EventStreamWatcher) processQueue(ctx context.Context) {
 }
 
 func (w *EventStreamWatcher) drainQueue(ctx context.Context) {
+	// Pipeline: fetch the next batch from Wikidata while the previous batch's
+	// DB writes are still in progress. The processing set guarantees crash
+	// safety — any QIDs left there after a crash are recovered at startup.
+
+	type batchResult struct {
+		qids            []string
+		perEntityErrors map[string]error
+		batchErr        error
+	}
+
+	// pending holds the in-flight fetch result for the next batch.
+	var pending <-chan batchResult
+
+	fetchAsync := func(qids []string) <-chan batchResult {
+		ch := make(chan batchResult, 1)
+		go func() {
+			perEntityErrors, batchErr := w.processor.ProcessEntities(qids)
+			ch <- batchResult{qids: qids, perEntityErrors: perEntityErrors, batchErr: batchErr}
+		}()
+		return ch
+	}
+
 	for {
 		if ctx.Err() != nil {
+			// Wait for in-flight fetch to finish before returning.
+			if pending != nil {
+				<-pending
+			}
 			return
 		}
 
-		qids, err := w.writer.PeekPendingBatch(retryBatchSize)
+		// Claim the next batch while we might still be writing the previous one.
+		qids, err := w.writer.ClaimPendingBatch(retryBatchSize)
 		if err != nil {
-			log.Printf("Error reading pending queue: %v", err)
+			slog.Error("error claiming pending batch", "error", err)
+			if pending != nil {
+				<-pending
+			}
 			return
 		}
+
+		// Start fetching the new batch asynchronously (if non-empty).
+		var nextPending <-chan batchResult
+		if len(qids) > 0 {
+			nextPending = fetchAsync(qids)
+		}
+
+		// Process the previously fetched batch (DB writes + ack).
+		if pending != nil {
+			res := <-pending
+			if !w.handleBatchResult(ctx, res.qids, res.perEntityErrors, res.batchErr) {
+				// Batch-level error (e.g. rate limit). Wait for in-flight too.
+				if nextPending != nil {
+					res2 := <-nextPending
+					// Re-enqueue the second batch since we're bailing out.
+					w.requeueOnFailure(res2.qids)
+				}
+				return
+			}
+		}
+
+		pending = nextPending
+
+		// Nothing left in the queue?
 		if len(qids) == 0 {
 			return
 		}
 
-		perEntityErrors, batchErr := w.processor.ProcessEntities(qids)
-		if batchErr != nil {
-			var rlErr *RateLimitedError
-			if errors.As(batchErr, &rlErr) {
-				if !rlErr.Maxlag {
-					log.Printf("Rate limited by Wikidata (429), backing off for %v", rlErr.RetryAfter)
-				}
-				select {
-				case <-ctx.Done():
-				case <-time.After(rlErr.RetryAfter):
-				}
-			} else {
-				log.Printf("Batch fetch failed: %v", batchErr)
-			}
-			return
-		}
-
-		// Determine which QIDs succeeded and which failed.
-		var succeeded []string
-		for _, qid := range qids {
-			if perr := perEntityErrors[qid]; perr != nil {
-				log.Printf("Error processing %s: %v", qid, perr)
-				if dlErr := w.writer.RecordFailedEntity(qid, perr.Error()); dlErr != nil {
-					log.Printf("Failed to record failed entity %s: %v", qid, dlErr)
-				}
-			}
-			// Remove from pending regardless — failures go to failed_entity table.
-			succeeded = append(succeeded, qid)
-		}
-
-		if err := w.writer.DeletePendingEntities(succeeded); err != nil {
-			log.Printf("Error removing processed entities from pending queue: %v", err)
-		}
-
-		// If the batch wasn't full, wait for the next tick rather. This makes the backlog
-		// purge faster reducing races with the enqueueing logic that would produce excessive
-		// network requests.
+		// If the batch wasn't full, drain the last one and stop.
 		if len(qids) < retryBatchSize {
+			if pending != nil {
+				res := <-pending
+				w.handleBatchResult(ctx, res.qids, res.perEntityErrors, res.batchErr)
+			}
 			return
 		}
+	}
+}
+
+// handleBatchResult processes the result of a ProcessEntities call: records
+// per-entity failures and acks all QIDs from the processing set. Returns false
+// if the batch failed entirely (caller should stop draining).
+func (w *EventStreamWatcher) handleBatchResult(ctx context.Context, qids []string, perEntityErrors map[string]error, batchErr error) bool {
+	if batchErr != nil {
+		var rlErr *RateLimitedError
+		if errors.As(batchErr, &rlErr) {
+			if !rlErr.Maxlag {
+				slog.Warn("rate limited by wikidata", "delay", rlErr.RetryAfter)
+			}
+			// Re-enqueue so they aren't lost in the processing set.
+			w.requeueOnFailure(qids)
+			select {
+			case <-ctx.Done():
+			case <-time.After(rlErr.RetryAfter):
+			}
+		} else {
+			slog.Error("batch fetch failed", "error", batchErr)
+			w.requeueOnFailure(qids)
+		}
+		return false
+	}
+
+	for _, qid := range qids {
+		if perr := perEntityErrors[qid]; perr != nil {
+			slog.Error("error processing entity", "qid", qid, "error", perr)
+			if dlErr := w.writer.RecordFailedEntity(qid, perr.Error()); dlErr != nil {
+				slog.Error("failed to record failed entity", "qid", qid, "error", dlErr)
+			}
+		}
+	}
+
+	if err := w.writer.AckProcessedEntities(qids); err != nil {
+		slog.Error("error acking processed entities", "error", err)
+	}
+
+	return true
+}
+
+// requeueOnFailure moves QIDs from the processing set back to pending so
+// they will be retried on the next drain cycle.
+func (w *EventStreamWatcher) requeueOnFailure(qids []string) {
+	if len(qids) == 0 {
+		return
+	}
+	if _, err := w.writer.EnqueueEntities(qids); err != nil {
+		slog.Error("failed to re-enqueue entities after batch failure", "error", err)
+		return
+	}
+	if err := w.writer.AckProcessedEntities(qids); err != nil {
+		slog.Error("failed to ack re-enqueued entities", "error", err)
 	}
 }
 
@@ -433,31 +553,31 @@ func (w *EventStreamWatcher) retryFailedEntities(ctx context.Context) {
 		case <-ticker.C:
 			qids, err := w.writer.LastFailedEntities(retryBatchSize)
 			if err != nil {
-				log.Printf("Failed to read failed entities: %v", err)
+				slog.Error("failed to read failed entities", "error", err)
 				continue
 			}
 			if len(qids) == 0 {
 				continue
 			}
 
-			log.Printf("Retrying %d failed entities", len(qids))
+			slog.Info("retrying failed entities", "count", len(qids))
 
 			perEntityErrors, batchErr := w.processor.ProcessEntities(qids)
 			if batchErr != nil {
-				log.Printf("Retry batch failed: %v", batchErr)
+				slog.Error("retry batch failed", "error", batchErr)
 				continue
 			}
 
 			for _, qid := range qids {
 				if perr := perEntityErrors[qid]; perr != nil {
-					log.Printf("Retry failed for %s: %v", qid, perr)
+					slog.Error("retry failed", "qid", qid, "error", perr)
 					if dlErr := w.writer.RecordFailedEntity(qid, perr.Error()); dlErr != nil {
-						log.Printf("Failed to update failed entity %s: %v", qid, dlErr)
+						slog.Error("failed to update failed entity", "qid", qid, "error", dlErr)
 					}
 				} else {
-					log.Printf("Retry succeeded for %s", qid)
+					slog.Info("retry succeeded", "qid", qid)
 					if err := w.writer.DeleteFailedEntity(qid); err != nil {
-						log.Printf("Failed to remove retry record for %s: %v", qid, err)
+						slog.Error("failed to remove retry record", "qid", qid, "error", err)
 					}
 				}
 			}

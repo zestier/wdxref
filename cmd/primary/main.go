@@ -94,5 +94,5 @@ func main() {
 		break
 	}
 
-	slog.Info("watcher stopped")
+	slog.Info("primary stopped")
 }

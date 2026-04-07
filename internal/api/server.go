@@ -1,27 +1,31 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goccy/go-json"
 
+	"github.com/ekeid/ekeid/internal/model"
 	"github.com/ekeid/ekeid/internal/store"
 )
 
+const apiReadTimeout = 5 * time.Second
+
 // Server holds dependencies for the API handlers.
 type Server struct {
-	reader      *store.Reader
-	version     string
-	rateLimiter *RateLimiter
+	reader  *store.Reader
+	version string
 }
 
 // NewServer creates a new API server.
-func NewServer(reader *store.Reader, version string, rateLimiter *RateLimiter) *Server {
-	return &Server{reader: reader, version: version, rateLimiter: rateLimiter}
+func NewServer(reader *store.Reader, version string) *Server {
+	return &Server{reader: reader, version: version}
 }
 
 // Handler returns the top-level HTTP handler with all routes and middleware.
@@ -33,11 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/lookup/{key}/{value...}", s.handleLookup)
 	mux.HandleFunc("GET /v1/lookup/{qid}", s.handleWikidataLookup)
 
-	var handler http.Handler = mux
-	if s.rateLimiter != nil {
-		handler = s.rateLimiter.Middleware(handler)
-	}
-	return s.applyMiddleware(handler)
+	return s.applyMiddleware(mux)
 }
 
 func (s *Server) applyMiddleware(next http.Handler) http.Handler {
@@ -78,13 +78,12 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.reader.LookupByProperty(property, value)
+	ctx, cancel := context.WithTimeout(r.Context(), apiReadTimeout)
+	defer cancel()
+
+	result, err := s.reader.LookupByPropertyContext(ctx, property, value)
 	if err != nil {
-		if errors.Is(err, store.ErrSchemaMismatch) {
-			writeError(w, http.StatusServiceUnavailable, "unavailable", "Schema migration in progress")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
+		s.writeReaderError(w, err)
 		return
 	}
 
@@ -94,19 +93,12 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert map[int][]string to map[string][]string for JSON output
-	mappings := make(map[string][]string, len(result.Mappings))
-	for k, v := range result.Mappings {
-		mappings[fmt.Sprintf("P%d", k)] = v
-	}
-
-	// Convert int64 wikidata_id back to Q-string for JSON response
 	wikidataIDStr := fmt.Sprintf("Q%d", result.WikidataID)
 
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	writeJSON(w, http.StatusOK, lookupResponse{
 		WikidataID: wikidataIDStr,
-		Mappings:   mappings,
+		Mappings:   result.Mappings,
 	})
 }
 
@@ -125,13 +117,12 @@ func (s *Server) handleWikidataLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.reader.LookupByWikidataID(wikidataID)
+	ctx, cancel := context.WithTimeout(r.Context(), apiReadTimeout)
+	defer cancel()
+
+	result, err := s.reader.LookupByWikidataIDContext(ctx, wikidataID)
 	if err != nil {
-		if errors.Is(err, store.ErrSchemaMismatch) {
-			writeError(w, http.StatusServiceUnavailable, "unavailable", "Schema migration in progress")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
+		s.writeReaderError(w, err)
 		return
 	}
 
@@ -141,65 +132,55 @@ func (s *Server) handleWikidataLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mappings := make(map[string][]string, len(result.Mappings))
-	for k, v := range result.Mappings {
-		mappings[fmt.Sprintf("P%d", k)] = v
-	}
-
 	wikidataIDStr := fmt.Sprintf("Q%d", result.WikidataID)
 
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	writeJSON(w, http.StatusOK, lookupResponse{
 		WikidataID: wikidataIDStr,
-		Mappings:   mappings,
+		Mappings:   result.Mappings,
 	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	info, err := s.reader.GetHealth()
+	ctx, cancel := context.WithTimeout(r.Context(), apiReadTimeout)
+	defer cancel()
+
+	info, err := s.reader.GetHealthContext(ctx)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to get health")
+		s.writeReaderError(w, err)
 		return
 	}
 
-	resp := healthResponse{
-		Status:       "ok",
-		Version:      s.version,
-		State:        info.State,
-		DatabaseSize: info.DatabaseSize,
-		SchemaMatch:  info.SchemaMatch,
-	}
-	if !info.DumpTime.IsZero() {
-		resp.DumpTime = info.DumpTime.Format("2006-01-02T15:04:05Z")
-	}
-	if !info.LastEventSync.IsZero() {
-		resp.LastEventSync = info.LastEventSync.Format("2006-01-02T15:04:05Z")
-	}
+	resp := healthResponse{commonResponse: s.newCommonResponse(info)}
 
 	w.Header().Set("Cache-Control", "no-cache")
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.reader.GetStats()
+	ctx, cancel := context.WithTimeout(r.Context(), apiReadTimeout)
+	defer cancel()
+
+	stats, err := s.reader.GetStatsContext(ctx)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to get stats")
+		s.writeReaderError(w, err)
 		return
 	}
 
 	resp := statsResponse{
-		State:        stats.State,
-		MappingCount: stats.MappingCount,
-		EntityCount:  stats.EntityCount,
-		PendingCount: stats.PendingCount,
-		FailedCount:  stats.FailedCount,
-		DatabaseSize: stats.DatabaseSize,
+		commonResponse:  s.newCommonResponse(&stats.HealthInfo),
+		LastEventID:     stats.LastEventID,
+		EntityCount:     stats.EntityCount,
+		PendingCount:    stats.PendingCount,
+		ProcessingCount: stats.ProcessingCount,
+		FailedCount:     stats.FailedCount,
+		StreamLength:    stats.StreamLength,
 	}
-	if !stats.DumpTime.IsZero() {
-		resp.DumpTime = stats.DumpTime.Format("2006-01-02T15:04:05Z")
+	if !stats.OldestEvent.IsZero() {
+		resp.OldestEvent = formatAPITime(stats.OldestEvent)
 	}
-	if !stats.LastEventSync.IsZero() {
-		resp.LastEventSync = stats.LastEventSync.Format("2006-01-02T15:04:05Z")
+	if !stats.NewestEvent.IsZero() {
+		resp.NewestEvent = formatAPITime(stats.NewestEvent)
 	}
 
 	w.Header().Set("Cache-Control", "no-cache")
@@ -209,11 +190,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 // Response types
 
 type lookupResponse struct {
-	WikidataID string              `json:"wikidata_id"`
-	Mappings   map[string][]string `json:"mappings"`
+	WikidataID string   `json:"wikidata_id"`
+	Mappings   []string `json:"mappings"`
 }
 
-type healthResponse struct {
+type commonResponse struct {
 	Status        string `json:"status"`
 	Version       string `json:"version"`
 	State         string `json:"state,omitempty"`
@@ -223,15 +204,20 @@ type healthResponse struct {
 	SchemaMatch   bool   `json:"schema_match"`
 }
 
+type healthResponse struct {
+	commonResponse
+}
+
 type statsResponse struct {
-	State         string `json:"state,omitempty"`
-	DumpTime      string `json:"dump_time,omitempty"`
-	LastEventSync string `json:"last_event_sync,omitempty"`
-	MappingCount  int64  `json:"mapping_count"`
-	EntityCount   int64  `json:"entity_count"`
-	PendingCount  int64  `json:"pending_count"`
-	FailedCount   int64  `json:"failed_count"`
-	DatabaseSize  int64  `json:"database_size"`
+	commonResponse
+	LastEventID     string `json:"last_event_id,omitempty"`
+	OldestEvent     string `json:"oldest_event,omitempty"`
+	NewestEvent     string `json:"newest_event,omitempty"`
+	EntityCount     int64  `json:"entity_count"`
+	PendingCount    int64  `json:"pending_count"`
+	ProcessingCount int64  `json:"processing_count"`
+	FailedCount     int64  `json:"failed_count"`
+	StreamLength    int64  `json:"stream_length"`
 }
 
 type errorResponse struct {
@@ -244,9 +230,42 @@ type errorResponse struct {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorResponse{Error: code, Message: message})
+}
+
+func (s *Server) newCommonResponse(info *model.HealthInfo) commonResponse {
+	resp := commonResponse{
+		Status:       "ok",
+		Version:      s.version,
+		State:        info.State,
+		DatabaseSize: info.DatabaseSize,
+		SchemaMatch:  info.SchemaMatch,
+	}
+	if !info.DumpTime.IsZero() {
+		resp.DumpTime = formatAPITime(info.DumpTime)
+	}
+	if !info.LastEventSync.IsZero() {
+		resp.LastEventSync = formatAPITime(info.LastEventSync)
+	}
+	return resp
+}
+
+func formatAPITime(t time.Time) string {
+	return t.Format("2006-01-02T15:04:05Z")
+}
+
+func (s *Server) writeReaderError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrSchemaMismatch) {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "Schema migration in progress")
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		writeError(w, http.StatusGatewayTimeout, "timeout", "Backend read timed out")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
 }

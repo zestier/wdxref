@@ -1,0 +1,88 @@
+services:
+  kvrocks:
+    image: docker.io/apache/kvrocks:2.11.0
+    command:
+      - "--dir"
+      - "/data/kvrocks"
+      - "--rocksdb.compression"
+      - "zstd"
+      # Memory: block cache is 4GB by default, way over the 2GB container limit
+      - "--rocksdb.block_cache_size"
+      - "768"
+      # Memory: smaller write buffers flush faster and use less RAM
+      # 4 column families × 2 buffers × 32MB = 256MB
+      - "--rocksdb.write_buffer_size"
+      - "32"
+      - "--rocksdb.max_write_buffer_number"
+      - "2"
+      # Memory: trigger WAL flushes sooner to bound WAL memory
+      - "--rocksdb.max_total_wal_size"
+      - "256"
+      # Stalls: rate-limit compaction I/O to 100MB/s so it doesn't starve reads
+      - "--max-io-mb"
+      - "100"
+      # Stalls: fewer parallel compaction threads = less memory spike, less I/O contention
+      - "--rocksdb.max_background_jobs"
+      - "2"
+      - "--rocksdb.max_subcompactions"
+      - "1"
+    restart: unless-stopped
+    volumes:
+      - kvrocks-data:/data/kvrocks
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6666", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  primary:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: primary
+    restart: unless-stopped
+    depends_on:
+      kvrocks:
+        condition: service_healthy
+    environment:
+      - KVROCKS_ADDR=kvrocks:6666
+      - DUMP_FORMAT=bz2
+      - CONTACT=${CONTACT:?Set CONTACT to a URL or email for Wikimedia User-Agent policy}
+
+  replicator:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: replicator
+    restart: unless-stopped
+    depends_on:
+      kvrocks:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    volumes:
+      - snapshots:/data/snapshots
+    environment:
+      - KVROCKS_ADDR=kvrocks:6666
+      - LISTEN_ADDR=:8081
+      - SNAPSHOT_DIR=/data/snapshots
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    depends_on:
+      kvrocks:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - KVROCKS_ADDR=kvrocks:6666
+      - LISTEN_ADDR=:8080
+
+volumes:
+  kvrocks-data:
+  snapshots:

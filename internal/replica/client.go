@@ -6,6 +6,7 @@ package replica
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -23,9 +24,15 @@ import (
 )
 
 const (
-	retryBaseDelay = 1 * time.Second
-	retryMaxDelay  = 60 * time.Second
+	retryBaseDelay    = 1 * time.Second
+	retryMaxDelay     = 60 * time.Second
+	seedingRetryDelay = 30 * time.Second
 )
+
+// errUpstreamSeeding is returned by connectStream when the upstream
+// sends a reset with state "seeding". The replica keeps its current
+// data and retries later instead of flushing immediately.
+var errUpstreamSeeding = errors.New("upstream is seeding, deferring reset")
 
 // Client implements the replica state machine that syncs from an upstream
 // replicator into a local Kvrocks instance.
@@ -81,8 +88,13 @@ func (c *Client) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			slog.Error("replica: stream error, retrying", "error", err)
-			sleepWithContext(ctx, retryBaseDelay)
+			if errors.Is(err, errUpstreamSeeding) {
+				slog.Info("replica: upstream is seeding, keeping current data and retrying later")
+				sleepWithContext(ctx, seedingRetryDelay)
+			} else {
+				slog.Error("replica: stream error, retrying", "error", err)
+				sleepWithContext(ctx, retryBaseDelay)
+			}
 			continue
 		}
 	}
@@ -316,6 +328,13 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 				upstreamState := resetInfo["state"]
 				reason := resetInfo["reason"]
 				slog.Info("replica: received reset", "reason", reason, "upstream_state", upstreamState)
+
+				// If upstream is still seeding, keep serving current data
+				// rather than flushing and having nothing to serve while
+				// we wait for a new snapshot.
+				if upstreamState == "seeding" {
+					return errUpstreamSeeding
+				}
 
 				// Flush and clear state so next iteration fetches snapshot.
 				if err := c.rdb.FlushDB(ctx).Err(); err != nil {

@@ -24,6 +24,10 @@ const (
 	// DefaultSnapshotInterval is how often to re-generate the snapshot file.
 	DefaultSnapshotInterval = 24 * time.Hour
 
+	// SnapshotRetryInterval is the delay between snapshot generation
+	// attempts when there is no valid snapshot available.
+	SnapshotRetryInterval = 30 * time.Second
+
 	// MaxConnectionDuration is how long a single SSE connection is allowed
 	// to stay open before the server closes it, forcing a reconnect.
 	MaxConnectionDuration = 15 * time.Minute

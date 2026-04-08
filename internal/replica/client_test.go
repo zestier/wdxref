@@ -441,6 +441,75 @@ func TestConnectStream_ResetEvent(t *testing.T) {
 	}
 }
 
+func TestConnectStream_ResetSeeding_DefersFlush(t *testing.T) {
+	c, s, _ := newTestClient(t)
+	ctx := context.Background()
+
+	// Pre-populate some data.
+	s.Set("some_key", "some_value")
+
+	resetData, _ := json.Marshal(map[string]string{
+		"state":  "seeding",
+		"reason": "no retained entries available for since 1234-0",
+	})
+	sseBody := fmt.Sprintf("event: reset\ndata: %s\n\n", resetData)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.Write([]byte(sseBody))
+	}))
+	defer srv.Close()
+
+	c.upstreamURL = srv.URL
+
+	err := c.connectStream(ctx, "1234-0")
+	if err == nil {
+		t.Fatal("expected errUpstreamSeeding, got nil")
+	}
+	if err != errUpstreamSeeding {
+		t.Fatalf("expected errUpstreamSeeding, got: %v", err)
+	}
+
+	// Data should NOT have been flushed.
+	if !s.Exists("some_key") {
+		t.Error("expected some_key to survive; replica should keep data while upstream is seeding")
+	}
+}
+
+func TestConnectStream_ResetStreaming_Flushes(t *testing.T) {
+	c, s, _ := newTestClient(t)
+	ctx := context.Background()
+
+	// Pre-populate some data.
+	s.Set("some_key", "some_value")
+
+	resetData, _ := json.Marshal(map[string]string{
+		"state":  "streaming",
+		"reason": "since 100-0 is older than oldest entry 5000-0",
+	})
+	sseBody := fmt.Sprintf("event: reset\ndata: %s\n\n", resetData)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.Write([]byte(sseBody))
+	}))
+	defer srv.Close()
+
+	c.upstreamURL = srv.URL
+
+	err := c.connectStream(ctx, "100-0")
+	if err != nil {
+		t.Fatalf("expected nil on reset with streaming state, got: %v", err)
+	}
+
+	// Data should have been flushed.
+	if s.Exists("some_key") {
+		t.Error("expected some_key to be flushed when upstream is streaming")
+	}
+}
+
 func TestConnectStream_NonOKStatus(t *testing.T) {
 	c, _, _ := newTestClient(t)
 	ctx := context.Background()

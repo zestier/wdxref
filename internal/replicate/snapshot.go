@@ -40,9 +40,10 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 // SnapshotGenerator periodically generates a snapshot of all entities and
 // writes it as a zstd-compressed line file with a companion meta.json.
 type SnapshotGenerator struct {
-	reader   *store.Reader
-	dir      string
-	interval time.Duration
+	reader     *store.Reader
+	dir        string
+	interval   time.Duration
+	regenerate chan struct{}
 }
 
 // NewSnapshotGenerator creates a new generator that writes snapshots to dir
@@ -52,9 +53,10 @@ func NewSnapshotGenerator(reader *store.Reader, dir string, interval time.Durati
 		interval = DefaultSnapshotInterval
 	}
 	return &SnapshotGenerator{
-		reader:   reader,
-		dir:      dir,
-		interval: interval,
+		reader:     reader,
+		dir:        dir,
+		interval:   interval,
+		regenerate: make(chan struct{}, 1),
 	}
 }
 
@@ -64,22 +66,31 @@ func (g *SnapshotGenerator) Run(ctx context.Context) {
 	g.cleanSnapshots()
 
 	for {
-		if err := g.generate(ctx); err != nil {
-			slog.Error("snapshot: generation failed", "error", err)
-		}
-
-		// Use a shorter retry interval until the first snapshot exists so we
-		// don't wait a full snapshot interval (potentially 24h) if the first
-		// attempt skips due to an empty changelog or transient error.
-		wait := g.interval
-		if g.readMeta() == nil {
-			wait = 30 * time.Second
+		// Wait until the current snapshot expires, or use a short retry
+		// interval if there's no valid snapshot (missing, stale, expired).
+		wait := SnapshotRetryInterval
+		if meta, current := g.isSnapshotCurrent(); current && !meta.CreatedAt.IsZero() {
+			if remaining := g.interval - time.Since(meta.CreatedAt); remaining > wait {
+				wait = remaining
+			}
 		}
 
 		select {
 		case <-ctx.Done():
 			return
+		case <-g.regenerate:
 		case <-time.After(wait):
+		}
+
+		if err := g.generate(ctx); err != nil {
+			slog.Error("snapshot: generation failed", "error", err)
+		}
+
+		// Drain any regenerate signals that arrived during generation
+		// so we don't immediately regenerate with a fresh snapshot.
+		select {
+		case <-g.regenerate:
+		default:
 		}
 	}
 }
@@ -127,6 +138,28 @@ func (g *SnapshotGenerator) cleanSnapshots() {
 	os.Remove(filepath.Join(g.dir, "meta.tmp"))
 }
 
+// isSnapshotCurrent reports whether the published snapshot is still usable.
+// A snapshot is current if meta.json exists and its stream ID is still covered
+// by the changelog. Returns the meta (possibly nil) for convenience.
+func (g *SnapshotGenerator) isSnapshotCurrent() (*snapshotMeta, bool) {
+	meta := g.readMeta()
+	if meta == nil {
+		return nil, false
+	}
+	if meta.ID == "" {
+		return meta, false
+	}
+	firstID, _, _, err := g.reader.StreamInfo()
+	if err != nil {
+		// Can't verify — treat as not current to be safe.
+		return meta, false
+	}
+	if firstID == "" || compareStreamIDs(meta.ID, firstID) < 0 {
+		return meta, false
+	}
+	return meta, true
+}
+
 // generate captures the current state of all entities and writes a zstd line
 // file where most entries are "<qid> <raw-mappings-json>". Each zstd frame
 // begins with a checkpoint control line, and the final line in the stream is a
@@ -136,27 +169,13 @@ func (g *SnapshotGenerator) cleanSnapshots() {
 //
 // Flow: write new snapshot → update meta.json → delete old snapshots.
 func (g *SnapshotGenerator) generate(ctx context.Context) error {
-	// Skip if a recent snapshot already exists (within the interval).
-	if meta := g.readMeta(); meta != nil && !meta.CreatedAt.IsZero() {
-		age := time.Since(meta.CreatedAt)
-		if age < g.interval {
-			slog.Info("snapshot: skipping, recent snapshot exists", "file", meta.File, "age", age.Round(time.Second))
-			return nil
-		}
-	}
-
 	// Record the changelog position before scanning.
 	_, lastID, _, err := g.reader.StreamInfo()
 	if err != nil {
 		return fmt.Errorf("stream info: %w", err)
 	}
 	if lastID == "" {
-		// The changelog is empty — skip this generation cycle. A snapshot
-		// with ID "0-0" would cause the replica to loop: the server always
-		// rejects since=0-0 with a reset, which clears replica state and
-		// triggers another snapshot fetch indefinitely.
-		slog.Info("snapshot: skipping, changelog is empty")
-		return nil
+		return fmt.Errorf("changelog is empty")
 	}
 
 	// Each snapshot gets a unique filename based on the current timestamp.
@@ -280,9 +299,19 @@ func (g *SnapshotGenerator) ServeSnapshot(w http.ResponseWriter, r *http.Request
 	// Try up to twice: if the referenced file was deleted between reading
 	// meta and opening the file, re-read meta to pick up the new snapshot.
 	for range 2 {
-		meta := g.readMeta()
+		meta, current := g.isSnapshotCurrent()
 		if meta == nil {
 			http.Error(w, "snapshot not yet available", http.StatusServiceUnavailable)
+			return
+		}
+		if !current {
+			slog.Info("snapshot: stale snapshot requested", "snapshot_id", meta.ID)
+			// Signal the Run loop to regenerate immediately.
+			select {
+			case g.regenerate <- struct{}{}:
+			default:
+			}
+			http.Error(w, "snapshot invalidated, regenerating", http.StatusServiceUnavailable)
 			return
 		}
 

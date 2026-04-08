@@ -392,13 +392,87 @@ func TestSnapshotGenerationSkipsEmptyChangelog(t *testing.T) {
 	dir := t.TempDir()
 	gen := NewSnapshotGenerator(reader, dir, time.Hour)
 
-	if err := gen.generate(context.Background()); err != nil {
-		t.Fatalf("generate returned unexpected error: %v", err)
+	err := gen.generate(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty changelog")
 	}
 
 	// No meta.json should have been written.
 	if meta := gen.readMeta(); meta != nil {
 		t.Errorf("expected no snapshot to be generated, got meta: %+v", meta)
+	}
+}
+
+func TestSnapshotGenerationInvalidatesStaleSnapshot(t *testing.T) {
+	w, reader, _, _ := testSetup(t)
+	ctx := context.Background()
+
+	// Create initial entities and a snapshot.
+	if err := w.UpsertEntity("Q1", []string{"P345:tt0000001"}); err != nil {
+		t.Fatalf("UpsertEntity: %v", err)
+	}
+	if err := w.SetSyncState("state", "streaming"); err != nil {
+		t.Fatalf("SetSyncState: %v", err)
+	}
+
+	dir := t.TempDir()
+	gen := NewSnapshotGenerator(reader, dir, time.Hour)
+
+	if err := gen.generate(ctx); err != nil {
+		t.Fatalf("initial generate: %v", err)
+	}
+	oldMeta := gen.readMeta()
+	if oldMeta == nil {
+		t.Fatal("expected snapshot to be generated")
+	}
+	oldFile := oldMeta.File
+
+	// Simulate a reseed: flush the database and add new data so the
+	// old snapshot's stream ID is no longer covered by the changelog.
+	if err := w.FlushDataContext(ctx); err != nil {
+		t.Fatalf("FlushDataContext: %v", err)
+	}
+	if err := w.UpsertEntity("Q2", []string{"P345:tt0000002"}); err != nil {
+		t.Fatalf("UpsertEntity after reseed: %v", err)
+	}
+	if err := w.SetSyncState("state", "streaming"); err != nil {
+		t.Fatalf("SetSyncState: %v", err)
+	}
+
+	// ServeSnapshot should detect the stale snapshot and return 503,
+	// signalling the Run loop to regenerate.
+	req := httptest.NewRequest("GET", "/replicate/snapshot", nil)
+	rec := httptest.NewRecorder()
+	gen.ServeSnapshot(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for stale snapshot, got %d", rec.Code)
+	}
+
+	// The regenerate channel should have been signalled.
+	select {
+	case <-gen.regenerate:
+		// good
+	default:
+		t.Error("expected regenerate signal")
+	}
+
+	// When generate() runs it removes the stale snapshot and creates a new one.
+	if err := gen.generate(ctx); err != nil {
+		t.Fatalf("generate after reseed: %v", err)
+	}
+
+	// Old snapshot file should have been removed by generate.
+	if _, err := os.Stat(filepath.Join(dir, oldFile)); err == nil {
+		t.Errorf("expected old snapshot file %s to be removed", oldFile)
+	}
+
+	newMeta := gen.readMeta()
+	if newMeta == nil {
+		t.Fatal("expected new snapshot to be generated after reseed")
+	}
+	if newMeta.File == oldFile {
+		t.Error("expected a different snapshot file after reseed")
 	}
 }
 
@@ -581,8 +655,15 @@ func writeTestSnapshot(t *testing.T, dir string, entities []store.SnapshotEntity
 }
 
 func TestServeSnapshot(t *testing.T) {
-	_, reader, _, _ := testSetup(t)
+	_, reader, rdb, _ := testSetup(t)
 	dir := t.TempDir()
+
+	// Add a changelog entry so the snapshot's stream ID is considered current.
+	rdb.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "500-0",
+		Values: map[string]interface{}{"q": "1", "a": "upsert", "m": "{}"},
+	})
 
 	entities := []store.SnapshotEntity{
 		{QID: 42, RawMappings: `["P345:tt0111161"]`},
@@ -648,8 +729,15 @@ func TestServeSnapshot(t *testing.T) {
 // --- ServeSnapshot resume ---
 
 func TestServeSnapshotResume(t *testing.T) {
-	_, reader, _, _ := testSetup(t)
+	_, reader, rdb, _ := testSetup(t)
 	dir := t.TempDir()
+
+	// Add a changelog entry so the snapshot's stream ID is considered current.
+	rdb.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "500-0",
+		Values: map[string]interface{}{"q": "1", "a": "upsert", "m": "{}"},
+	})
 
 	// Create snapshot with 4 entities (frames at offset 0 and after entity 2).
 	entities := []store.SnapshotEntity{

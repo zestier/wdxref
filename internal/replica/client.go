@@ -189,10 +189,25 @@ func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
 	scanner := bufio.NewScanner(zr)
 	scanner.Buffer(make([]byte, 1024*1024), 4*1024*1024)
 
+	const snapshotBatchSize = 500
+
 	var appliedThisRun int64
 	var lineNumber int64
 	var seenDone bool
 	var snapshotID string
+	var pendingBatch []store.RawEntityRecord
+
+	flushBatch := func() error {
+		if len(pendingBatch) == 0 {
+			return nil
+		}
+		if err := c.writer.UpsertRawEntitiesBatchContext(ctx, pendingBatch); err != nil {
+			return err
+		}
+		appliedThisRun += int64(len(pendingBatch))
+		pendingBatch = pendingBatch[:0]
+		return nil
+	}
 
 	for scanner.Scan() {
 		if seenDone {
@@ -208,12 +223,23 @@ func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("parse snapshot entity line %d: %w", lineNumber, err)
 			}
-			if err := c.applySnapshotEntity(ctx, qid, rawMappings); err != nil {
-				return "", fmt.Errorf("apply entity Q%d: %w", qid, err)
+			pendingBatch = append(pendingBatch, store.RawEntityRecord{
+				WikidataID:  fmt.Sprintf("Q%d", qid),
+				RawMappings: rawMappings,
+			})
+			if len(pendingBatch) >= snapshotBatchSize {
+				if err := flushBatch(); err != nil {
+					return "", fmt.Errorf("flush batch at line %d: %w", lineNumber, err)
+				}
 			}
-			appliedThisRun++
 
 		case replicate.SnapshotLineTypeControl:
+			// Flush pending entities before processing control lines so
+			// entity counts are accurate for checkpoint/done validation.
+			if err := flushBatch(); err != nil {
+				return "", fmt.Errorf("flush batch before control line %d: %w", lineNumber, err)
+			}
+
 			control, err := replicate.ParseSnapshotControl(line)
 			if err != nil {
 				return "", fmt.Errorf("parse snapshot control line %d: %w", lineNumber, err)
@@ -253,6 +279,9 @@ func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("invalid snapshot line %d", lineNumber)
 		}
 	}
+	if err := flushBatch(); err != nil {
+		return "", fmt.Errorf("flush final batch: %w", err)
+	}
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("scan snapshot: %w", err)
 	}
@@ -277,14 +306,6 @@ func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
 
 	slog.Info("replica: snapshot applied", "total_entities", totalEntities, "new_entities", appliedThisRun, "stream_id", snapshotID)
 	return snapshotID, nil
-}
-
-// applySnapshotEntity writes a single entity from the snapshot.
-func (c *Client) applySnapshotEntity(ctx context.Context, qid int64, rawMappings string) error {
-	return c.writer.UpsertRawEntitiesBatchContext(ctx, []store.RawEntityRecord{{
-		WikidataID:  fmt.Sprintf("Q%d", qid),
-		RawMappings: rawMappings,
-	}})
 }
 
 // connectStream connects to the upstream SSE stream and applies changes.

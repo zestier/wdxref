@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -24,8 +25,10 @@ const (
 
 // Writer provides read-write access to Kvrocks (used by the primary and replica).
 type Writer struct {
-	rdb         *redis.Client
-	noChangelog bool
+	rdb          *redis.Client
+	noChangelog  bool
+	scriptsOnce  sync.Once
+	scriptsError error
 }
 
 // Lua scripts executed atomically on the server.
@@ -159,13 +162,17 @@ func (w *Writer) noChangelogFlag() string {
 // loadScripts ensures all Lua scripts are loaded into the server cache.
 // This is necessary before using scripts in pipelines, which cannot
 // fallback from EVALSHA to EVAL automatically.
+// Scripts are loaded exactly once per Writer lifetime.
 func (w *Writer) loadScripts(ctx context.Context) error {
-	for _, s := range []*redis.Script{upsertScript, deleteScript, recordFailedScript} {
-		if err := s.Load(ctx, w.rdb).Err(); err != nil {
-			return fmt.Errorf("load lua script: %w", err)
+	w.scriptsOnce.Do(func() {
+		for _, s := range []*redis.Script{upsertScript, deleteScript, recordFailedScript} {
+			if err := s.Load(ctx, w.rdb).Err(); err != nil {
+				w.scriptsError = fmt.Errorf("load lua script: %w", err)
+				return
+			}
 		}
-	}
-	return nil
+	})
+	return w.scriptsError
 }
 
 // EntityRecord holds the data for a single entity upsert within a batch.

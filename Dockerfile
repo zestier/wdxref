@@ -29,7 +29,6 @@ CMD ["primary"]
 
 FROM runtime AS replicator
 COPY --from=build-replicator /replicator /usr/local/bin/replicator
-EXPOSE 8081
 CMD ["replicator"]
 
 FROM runtime AS replica
@@ -38,5 +37,4 @@ CMD ["replica"]
 
 FROM runtime AS api
 COPY --from=build-api /api-server /usr/local/bin/api-server
-EXPOSE 8080
 CMD ["api-server"]

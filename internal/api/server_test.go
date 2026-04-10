@@ -32,9 +32,29 @@ func setupTestServer(t *testing.T) (*Server, *store.Writer) {
 	return srv, w
 }
 
+// testUpsertEntity is a test helper that wraps Pipe for convenience.
+func testUpsertEntity(t *testing.T, w *store.Writer, wikidataID string, mappings []string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.UpsertEntity(store.EntityRecord{WikidataID: wikidataID, Mappings: mappings})
+	if err := p.Exec(); err != nil {
+		t.Fatalf("UpsertEntity(%s): %v", wikidataID, err)
+	}
+}
+
+// testSetSyncState is a test helper that wraps Pipe for convenience.
+func testSetSyncState(t *testing.T, w *store.Writer, key, value string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.SetSyncState(key, value)
+	if err := p.Exec(); err != nil {
+		t.Fatalf("SetSyncState(%s): %v", key, err)
+	}
+}
+
 func TestLookupSuccess(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", []string{"P345:tt0111161", "P4947:278", "P4835:2095", "P8013:the-shawshank-redemption"})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161", "P4947:278", "P4835:2095", "P8013:the-shawshank-redemption"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt0111161", nil)
 	rec := httptest.NewRecorder()
@@ -125,7 +145,7 @@ func TestLookupInvalidProperty(t *testing.T) {
 
 func TestWikidataLookupSuccess(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", []string{"P345:tt0111161", "P4947:278"})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161", "P4947:278"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/Q172241", nil)
 	rec := httptest.NewRecorder()
@@ -188,8 +208,8 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	srv, w := setupTestServer(t)
 
 	// Same TMDB ID "278" for movie (P4947) and TV (P4983)
-	w.UpsertEntity("Q172241", []string{"P4947:278", "P345:tt0111161"})
-	w.UpsertEntity("Q999999", []string{"P4983:278", "P345:tt9999999"})
+	testUpsertEntity(t, w, "Q172241", []string{"P4947:278", "P345:tt0111161"})
+	testUpsertEntity(t, w, "Q999999", []string{"P4983:278", "P345:tt9999999"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/P4947/278", nil)
 	rec := httptest.NewRecorder()
@@ -221,10 +241,10 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt0000001", "P4947:1"})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
-	w.SetSyncState("state", "streaming")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
 
 	req := httptest.NewRequest("GET", "/v1/health", nil)
 	rec := httptest.NewRecorder()
@@ -263,11 +283,11 @@ func TestHealthEndpoint(t *testing.T) {
 func TestStatsEndpoint(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt0000001", "P4947:1"})
-	w.UpsertEntity("Q2", []string{"P345:tt0000002", "P4947:2"})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
-	w.SetSyncState("state", "streaming")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt0000002", "P4947:2"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
 
 	req := httptest.NewRequest("GET", "/v1/stats", nil)
 	rec := httptest.NewRecorder()
@@ -325,10 +345,10 @@ func TestStatsEndpoint(t *testing.T) {
 func TestStatsSharesHealthFields(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt0000001", "P4947:1"})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
-	w.SetSyncState("state", "streaming")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
 
 	healthReq := httptest.NewRequest("GET", "/v1/health", nil)
 	healthRec := httptest.NewRecorder()
@@ -448,7 +468,7 @@ func TestHealthSchemaMatchTrue(t *testing.T) {
 
 func TestLookupCaseInsensitiveProperty(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", []string{"P345:tt0111161"})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161"})
 
 	// Lowercase "p" should also work
 	req := httptest.NewRequest("GET", "/v1/lookup/p345/tt0111161", nil)
@@ -476,10 +496,10 @@ func setupMismatchedServer(t *testing.T) *Server {
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	// Corrupt the schema version so the Reader sees a mismatch
-	w.SetSyncState("schema_version", "wrong-version")
+	testSetSyncState(t, w, "schema_version", "wrong-version")
 
 	r := store.NewReader(c)
 	return NewServer(r, "0.1.0-test")
@@ -546,8 +566,8 @@ func TestHealthSchemaMismatch(t *testing.T) {
 func TestStatsEntityCount(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2", "P4947:100"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2", "P4947:100"})
 
 	req := httptest.NewRequest("GET", "/v1/stats", nil)
 	rec := httptest.NewRecorder()
@@ -568,7 +588,7 @@ func TestStatsEntityCount(t *testing.T) {
 
 func TestLookupCanceledRequestReturnsGatewayTimeout(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

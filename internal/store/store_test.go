@@ -34,10 +34,95 @@ func newTestWriter(t *testing.T) *Writer {
 	return w
 }
 
-func TestWriterCreatesSchema(t *testing.T) {
-	w := newTestWriter(t)
+// Test helpers that wrap Pipe for convenience (replacing the removed Writer methods).
 
-	val, err := w.GetSyncState("schema_version")
+func testUpsertEntity(t *testing.T, w *Writer, wikidataID string, mappings []string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.UpsertEntity(EntityRecord{WikidataID: wikidataID, Mappings: mappings})
+	return p.Exec()
+}
+
+func testDeleteEntity(t *testing.T, w *Writer, wikidataID string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.DeleteEntity(wikidataID)
+	return p.Exec()
+}
+
+func testUpsertEntitiesBatch(t *testing.T, w *Writer, records []EntityRecord) error {
+	t.Helper()
+	if len(records) == 0 {
+		return nil
+	}
+	p := w.NewPipe(context.Background())
+	for _, rec := range records {
+		p.UpsertEntity(rec)
+	}
+	return p.Exec()
+}
+
+func testDeleteEntitiesBatch(t *testing.T, w *Writer, qids []string) error {
+	t.Helper()
+	if len(qids) == 0 {
+		return nil
+	}
+	p := w.NewPipe(context.Background())
+	for _, qid := range qids {
+		p.DeleteEntity(qid)
+	}
+	return p.Exec()
+}
+
+func testSetSyncState(t *testing.T, w *Writer, key, value string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.SetSyncState(key, value)
+	return p.Exec()
+}
+
+func testEnqueueEntities(t *testing.T, w *Writer, qids []string) error {
+	t.Helper()
+	if len(qids) == 0 {
+		return nil
+	}
+	p := w.NewPipe(context.Background())
+	p.EnqueueEntities(qids)
+	return p.Exec()
+}
+
+func testAckProcessedEntities(t *testing.T, w *Writer, qids []string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.AckProcessedEntities(qids)
+	return p.Exec()
+}
+
+func testRecordFailedEntity(t *testing.T, w *Writer, wikidataID, errMsg string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.RecordFailedEntity(wikidataID, errMsg)
+	return p.Exec()
+}
+
+func testDeleteFailedEntity(t *testing.T, w *Writer, wikidataID string) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.DeleteFailedEntity(wikidataID)
+	return p.Exec()
+}
+
+func testClearSyncCursors(t *testing.T, w *Writer) error {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.DelSyncStates("dump_time", "last_event_id")
+	return p.Exec()
+}
+
+func TestWriterCreatesSchema(t *testing.T) {
+	_, r := newTestSetup(t)
+
+	val, err := r.GetSyncState("schema_version")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -50,7 +135,7 @@ func TestUpsertAndLookup(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids := []string{"P345:tt0111161", "P4835:2095", "P4947:278", "P8013:the-shawshank-redemption"}
-	err := w.UpsertEntity("Q172241", ids)
+	err := testUpsertEntity(t, w, "Q172241", ids)
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -100,7 +185,7 @@ func TestLookupNotFound(t *testing.T) {
 
 func TestLookupByPropertyContextCanceled(t *testing.T) {
 	w, r := newTestSetup(t)
-	if err := w.UpsertEntity("Q1", []string{"P345:tt1"}); err != nil {
+	if err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1"}); err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
@@ -117,13 +202,13 @@ func TestUpsertUpdatesEntity(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids1 := []string{"P345:tt0903747", "P4983:1396"}
-	err := w.UpsertEntity("Q1079", ids1)
+	err := testUpsertEntity(t, w, "Q1079", ids1)
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
 	ids2 := []string{"P345:tt0903747", "P4983:1396", "P2638:169", "P4835:81189"}
-	err = w.UpsertEntity("Q1079", ids2)
+	err = testUpsertEntity(t, w, "Q1079", ids2)
 	if err != nil {
 		t.Fatalf("UpsertEntity (update): %v", err)
 	}
@@ -144,13 +229,13 @@ func TestUpsertRemovesOldIDs(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids1 := []string{"P345:tt0903747", "P2638:169", "P4983:1396"}
-	err := w.UpsertEntity("Q1079", ids1)
+	err := testUpsertEntity(t, w, "Q1079", ids1)
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
 	ids2 := []string{"P345:tt0903747", "P4983:1396"}
-	err = w.UpsertEntity("Q1079", ids2)
+	err = testUpsertEntity(t, w, "Q1079", ids2)
 	if err != nil {
 		t.Fatalf("UpsertEntity (update): %v", err)
 	}
@@ -180,7 +265,7 @@ func TestLookupByWikidataID(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids := []string{"P345:tt0111161", "P4947:278"}
-	w.UpsertEntity("Q172241", ids)
+	testUpsertEntity(t, w, "Q172241", ids)
 
 	result, err := r.LookupByWikidataID(172241)
 	if err != nil {
@@ -213,12 +298,12 @@ func TestDeleteEntity(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids := []string{"P345:tt0111161", "P4947:278"}
-	err := w.UpsertEntity("Q172241", ids)
+	err := testUpsertEntity(t, w, "Q172241", ids)
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
-	err = w.DeleteEntity("Q172241")
+	err = testDeleteEntity(t, w, "Q172241")
 	if err != nil {
 		t.Fatalf("DeleteEntity: %v", err)
 	}
@@ -235,7 +320,7 @@ func TestDeleteEntity(t *testing.T) {
 func TestDeleteEntityCascadesMappings(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntity("Q1", []string{"P345:tt1", "P4835:200", "P4947:100"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4835:200", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -248,7 +333,7 @@ func TestDeleteEntityCascadesMappings(t *testing.T) {
 		t.Fatalf("expected 3 mappings before delete, got %+v", result)
 	}
 
-	err = w.DeleteEntity("Q1")
+	err = testDeleteEntity(t, w, "Q1")
 	if err != nil {
 		t.Fatalf("DeleteEntity: %v", err)
 	}
@@ -273,11 +358,11 @@ func TestDeleteEntityCascadesMappings(t *testing.T) {
 func TestDeleteEntitiesBatchCascade(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3"})
 
-	err := w.DeleteEntitiesBatch([]string{"Q1", "Q3"})
+	err := testDeleteEntitiesBatch(t, w, []string{"Q1", "Q3"})
 	if err != nil {
 		t.Fatalf("DeleteEntitiesBatch: %v", err)
 	}
@@ -309,9 +394,10 @@ func TestMigrateSchemaFreshDB(t *testing.T) {
 	}
 	defer c.Close()
 	w := NewWriter(c)
+	r := NewReaderFromWriter(w)
 
 	// Before MigrateSchema, schema_version is not set.
-	val, err := w.GetSyncState("schema_version")
+	val, err := r.GetSyncState("schema_version")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -323,7 +409,7 @@ func TestMigrateSchemaFreshDB(t *testing.T) {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
 
-	val, err = w.GetSyncState("schema_version")
+	val, err = r.GetSyncState("schema_version")
 	if err != nil {
 		t.Fatalf("GetSyncState after migrate: %v", err)
 	}
@@ -335,7 +421,7 @@ func TestMigrateSchemaFreshDB(t *testing.T) {
 func TestMigrateSchemaMatchingVersion(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntity("Q1", []string{"P345:tt1"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -357,12 +443,12 @@ func TestMigrateSchemaMatchingVersion(t *testing.T) {
 func TestMigrateSchemaDropsOnMismatch(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	err := w.UpsertEntity("Q1", []string{"P345:tt1"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
-	w.SetSyncState("schema_version", "old-wrong-version")
-	w.SetSyncState("dump_time", "2026-01-01T00:00:00Z")
+	testSetSyncState(t, w, "schema_version", "old-wrong-version")
+	testSetSyncState(t, w, "dump_time", "2026-01-01T00:00:00Z")
 
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
@@ -378,7 +464,7 @@ func TestMigrateSchemaDropsOnMismatch(t *testing.T) {
 		t.Error("expected data to be dropped after schema mismatch")
 	}
 
-	val, err := w.GetSyncState("dump_time")
+	val, err := r.GetSyncState("dump_time")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -386,7 +472,7 @@ func TestMigrateSchemaDropsOnMismatch(t *testing.T) {
 		t.Errorf("expected dump_time to be cleared, got %q", val)
 	}
 
-	val, err = w.GetSyncState("schema_version")
+	val, err = r.GetSyncState("schema_version")
 	if err != nil {
 		t.Fatalf("GetSyncState schema_version: %v", err)
 	}
@@ -398,8 +484,8 @@ func TestMigrateSchemaDropsOnMismatch(t *testing.T) {
 func TestReaderSchemaMismatchLookupByProperty(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.SetSyncState("schema_version", "wrong-version")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testSetSyncState(t, w, "schema_version", "wrong-version")
 
 	// Create a new Reader — it should detect the mismatch.
 	c := &Client{rdb: w.rdb}
@@ -414,8 +500,8 @@ func TestReaderSchemaMismatchLookupByProperty(t *testing.T) {
 func TestReaderSchemaMismatchLookupByWikidataID(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.SetSyncState("schema_version", "wrong-version")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testSetSyncState(t, w, "schema_version", "wrong-version")
 
 	c := &Client{rdb: w.rdb}
 	r := NewReader(c)
@@ -438,7 +524,7 @@ func TestReaderSchemaMismatchHealth(t *testing.T) {
 		t.Error("expected SchemaMatch=true with correct version")
 	}
 
-	w.SetSyncState("schema_version", "wrong-version")
+	testSetSyncState(t, w, "schema_version", "wrong-version")
 
 	c := &Client{rdb: w.rdb}
 	r2 := NewReader(c)
@@ -486,9 +572,9 @@ func TestEntityCountInStats(t *testing.T) {
 		t.Errorf("initial EntityCount = %d, want 0", stats.EntityCount)
 	}
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3", "P4947:100"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3", "P4947:100"})
 
 	stats, err = r.GetStats()
 	if err != nil {
@@ -498,7 +584,7 @@ func TestEntityCountInStats(t *testing.T) {
 		t.Errorf("EntityCount = %d, want 3", stats.EntityCount)
 	}
 
-	w.DeleteEntity("Q2")
+	testDeleteEntity(t, w, "Q2")
 	stats, err = r.GetStats()
 	if err != nil {
 		t.Fatalf("GetStats after delete: %v", err)
@@ -522,7 +608,7 @@ func TestSchemaVersionDeterministic(t *testing.T) {
 func TestMigrateSchemaIdempotent(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("second MigrateSchema: %v", err)
@@ -540,18 +626,18 @@ func TestMigrateSchemaIdempotent(t *testing.T) {
 func TestDeleteEntitiesBatchEmpty(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	if err := w.DeleteEntitiesBatch(nil); err != nil {
+	if err := testDeleteEntitiesBatch(t, w, nil); err != nil {
 		t.Fatalf("DeleteEntitiesBatch(nil): %v", err)
 	}
-	if err := w.DeleteEntitiesBatch([]string{}); err != nil {
+	if err := testDeleteEntitiesBatch(t, w, []string{}); err != nil {
 		t.Fatalf("DeleteEntitiesBatch(empty): %v", err)
 	}
 }
 
 func TestSyncState(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	val, err := w.GetSyncState("last_sync")
+	val, err := r.GetSyncState("last_sync")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -559,12 +645,12 @@ func TestSyncState(t *testing.T) {
 		t.Errorf("expected empty, got %q", val)
 	}
 
-	err = w.SetSyncState("last_sync", "2026-03-10T14:22:00Z")
+	err = testSetSyncState(t, w, "last_sync", "2026-03-10T14:22:00Z")
 	if err != nil {
 		t.Fatalf("SetSyncState: %v", err)
 	}
 
-	val, err = w.GetSyncState("last_sync")
+	val, err = r.GetSyncState("last_sync")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -572,12 +658,12 @@ func TestSyncState(t *testing.T) {
 		t.Errorf("got %q, want %q", val, "2026-03-10T14:22:00Z")
 	}
 
-	err = w.SetSyncState("last_sync", "2026-03-11T10:00:00Z")
+	err = testSetSyncState(t, w, "last_sync", "2026-03-11T10:00:00Z")
 	if err != nil {
 		t.Fatalf("SetSyncState update: %v", err)
 	}
 
-	val, err = w.GetSyncState("last_sync")
+	val, err = r.GetSyncState("last_sync")
 	if err != nil {
 		t.Fatalf("GetSyncState after update: %v", err)
 	}
@@ -594,10 +680,10 @@ func TestGetStats(t *testing.T) {
 		t.Fatalf("GetStats: %v", err)
 	}
 
-	w.UpsertEntity("Q1", []string{"P345:tt0000001", "P4947:1"})
-	w.UpsertEntity("Q2", []string{"P4947:2"})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testUpsertEntity(t, w, "Q2", []string{"P4947:2"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
 
 	stats, err = r.GetStats()
 	if err != nil {
@@ -628,7 +714,7 @@ func TestGetStats(t *testing.T) {
 		t.Errorf("NewestEvent = %v, should be >= OldestEvent = %v", stats.NewestEvent, stats.OldestEvent)
 	}
 
-	w.SetSyncState("state", "streaming")
+	testSetSyncState(t, w, "state", "streaming")
 	stats, err = r.GetStats()
 	if err != nil {
 		t.Fatalf("GetStats with state: %v", err)
@@ -641,13 +727,13 @@ func TestGetStats(t *testing.T) {
 func TestUpsertConflictingExternalID(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntity("Q100", []string{"P345:tt1234567", "P4947:100"})
+	err := testUpsertEntity(t, w, "Q100", []string{"P345:tt1234567", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity Q100: %v", err)
 	}
 
 	// Q200 claims the same IMDb ID — latest write wins the p: index.
-	err = w.UpsertEntity("Q200", []string{"P345:tt1234567", "P4947:200"})
+	err = testUpsertEntity(t, w, "Q200", []string{"P345:tt1234567", "P4947:200"})
 	if err != nil {
 		t.Fatalf("UpsertEntity Q200 should succeed but got: %v", err)
 	}
@@ -680,13 +766,13 @@ func TestPropertyDisambiguation(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	movieIDs := []string{"P4947:278"}
-	err := w.UpsertEntity("Q172241", movieIDs)
+	err := testUpsertEntity(t, w, "Q172241", movieIDs)
 	if err != nil {
 		t.Fatalf("UpsertEntity movie: %v", err)
 	}
 
 	tvIDs := []string{"P4983:278"}
-	err = w.UpsertEntity("Q999999", tvIDs)
+	err = testUpsertEntity(t, w, "Q999999", tvIDs)
 	if err != nil {
 		t.Fatalf("UpsertEntity tv: %v", err)
 	}
@@ -720,7 +806,7 @@ func TestUpsertEntitiesBatch(t *testing.T) {
 			Mappings: []string{"P1733:620", "P5794:72"}},
 	}
 
-	if err := w.UpsertEntitiesBatch(records); err != nil {
+	if err := testUpsertEntitiesBatch(t, w, records); err != nil {
 		t.Fatalf("UpsertEntitiesBatch: %v", err)
 	}
 
@@ -755,10 +841,10 @@ func TestUpsertEntitiesBatch(t *testing.T) {
 func TestUpsertEntitiesBatchEmpty(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	if err := w.UpsertEntitiesBatch(nil); err != nil {
+	if err := testUpsertEntitiesBatch(t, w, nil); err != nil {
 		t.Fatalf("UpsertEntitiesBatch(nil): %v", err)
 	}
-	if err := w.UpsertEntitiesBatch([]EntityRecord{}); err != nil {
+	if err := testUpsertEntitiesBatch(t, w, []EntityRecord{}); err != nil {
 		t.Fatalf("UpsertEntitiesBatch(empty): %v", err)
 	}
 }
@@ -766,11 +852,11 @@ func TestUpsertEntitiesBatchEmpty(t *testing.T) {
 func TestUpsertEntitiesBatchUpdatesExisting(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	if err := w.UpsertEntity("Q172241", []string{"P345:tt0111161"}); err != nil {
+	if err := testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161"}); err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
-	if err := w.UpsertEntitiesBatch([]EntityRecord{{
+	if err := testUpsertEntitiesBatch(t, w, []EntityRecord{{
 		WikidataID: "Q172241",
 		Mappings:   []string{"P345:tt0111161", "P4947:278"},
 	}}); err != nil {
@@ -790,7 +876,7 @@ func TestMultiValuedProperty(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	ids := []string{"P345:tt0111161", "P345:tt9999999"}
-	err := w.UpsertEntity("Q172241", ids)
+	err := testUpsertEntity(t, w, "Q172241", ids)
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -813,17 +899,14 @@ func TestMultiValuedProperty(t *testing.T) {
 }
 
 func TestPendingQueue(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	n, err := w.EnqueueEntities([]string{"Q1", "Q2", "Q3"})
+	err := testEnqueueEntities(t, w, []string{"Q1", "Q2", "Q3"})
 	if err != nil {
 		t.Fatalf("EnqueueEntities: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("inserted = %d, want 3", n)
-	}
 
-	count, err := w.PendingCount()
+	count, err := r.PendingCount()
 	if err != nil {
 		t.Fatalf("PendingCount: %v", err)
 	}
@@ -840,34 +923,30 @@ func TestPendingQueue(t *testing.T) {
 	}
 
 	// ClaimPendingBatch moves items out of pending.
-	count, _ = w.PendingCount()
+	count, _ = r.PendingCount()
 	if count != 1 {
 		t.Errorf("PendingCount after claim = %d, want 1", count)
 	}
 
-	if err := w.AckProcessedEntities(batch); err != nil {
+	if err := testAckProcessedEntities(t, w, batch); err != nil {
 		t.Fatalf("AckProcessedEntities: %v", err)
 	}
 
 	// Duplicate insert is idempotent.
-	n, _ = w.EnqueueEntities([]string{"Q1", "Q1", "Q1"})
-	// SADD returns count of actually added.
-	if n < 0 {
-		t.Error("EnqueueEntities should not return negative")
-	}
+	_ = testEnqueueEntities(t, w, []string{"Q1", "Q1", "Q1"})
 }
 
 func TestFailedEntities(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	if err := w.RecordFailedEntity("Q1", "timeout"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q1", "timeout"); err != nil {
 		t.Fatalf("RecordFailedEntity: %v", err)
 	}
-	if err := w.RecordFailedEntity("Q2", "404"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q2", "404"); err != nil {
 		t.Fatalf("RecordFailedEntity Q2: %v", err)
 	}
 
-	failed, err := w.LastFailedEntities(10)
+	failed, err := r.LastFailedEntities(10)
 	if err != nil {
 		t.Fatalf("LastFailedEntities: %v", err)
 	}
@@ -875,37 +954,37 @@ func TestFailedEntities(t *testing.T) {
 		t.Errorf("failed = %d, want 2", len(failed))
 	}
 
-	if err := w.DeleteFailedEntity("Q1"); err != nil {
+	if err := testDeleteFailedEntity(t, w, "Q1"); err != nil {
 		t.Fatalf("DeleteFailedEntity: %v", err)
 	}
 
-	failed, _ = w.LastFailedEntities(10)
+	failed, _ = r.LastFailedEntities(10)
 	if len(failed) != 1 {
 		t.Errorf("failed after delete = %d, want 1", len(failed))
 	}
 }
 
 func TestClearSyncCursors(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	w.SetSyncState("dump_time", "2026-01-01T00:00:00Z")
-	w.SetSyncState("last_event_id", "some-id")
+	testSetSyncState(t, w, "dump_time", "2026-01-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", "some-id")
 
-	if err := w.ClearSyncCursors(); err != nil {
+	if err := testClearSyncCursors(t, w); err != nil {
 		t.Fatalf("ClearSyncCursors: %v", err)
 	}
 
-	dt, _ := w.GetSyncState("dump_time")
+	dt, _ := r.GetSyncState("dump_time")
 	if dt != "" {
 		t.Errorf("dump_time should be cleared, got %q", dt)
 	}
-	eid, _ := w.GetSyncState("last_event_id")
+	eid, _ := r.GetSyncState("last_event_id")
 	if eid != "" {
 		t.Errorf("last_event_id should be cleared, got %q", eid)
 	}
 
 	// Schema version should still be present.
-	sv, _ := w.GetSyncState("schema_version")
+	sv, _ := r.GetSyncState("schema_version")
 	if sv != SchemaVersion() {
 		t.Errorf("schema_version = %q, want %q", sv, SchemaVersion())
 	}
@@ -921,10 +1000,10 @@ func TestUpsertEntitiesBatchDoesNotDoubleCountExistingEntity(t *testing.T) {
 		Mappings:   []string{"P345:tt1"},
 	}}
 
-	if err := w.UpsertEntitiesBatch(records); err != nil {
+	if err := testUpsertEntitiesBatch(t, w, records); err != nil {
 		t.Fatalf("first UpsertEntitiesBatch: %v", err)
 	}
-	if err := w.UpsertEntitiesBatch(records); err != nil {
+	if err := testUpsertEntitiesBatch(t, w, records); err != nil {
 		t.Fatalf("second UpsertEntitiesBatch: %v", err)
 	}
 
@@ -943,10 +1022,12 @@ func TestUpsertEntitiesBatchContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := w.UpsertEntitiesBatchContext(ctx, []EntityRecord{{
+	p := w.NewPipe(ctx)
+	p.UpsertEntity(EntityRecord{
 		WikidataID: "Q1",
 		Mappings:   []string{"P345:tt1"},
-	}})
+	})
+	err := p.Exec()
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context canceled", err)
 	}
@@ -957,7 +1038,7 @@ func TestUpsertEntitiesBatchContextCanceled(t *testing.T) {
 func TestUpsertWritesToChangelog(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntity("Q1", []string{"P345:tt1", "P4947:100"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -986,8 +1067,8 @@ func TestUpsertWritesToChangelog(t *testing.T) {
 func TestDeleteWritesToChangelog(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.DeleteEntity("Q1")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testDeleteEntity(t, w, "Q1")
 
 	events, err := r.StreamRead(context.Background(), "0", 10, 0)
 	if err != nil {
@@ -1007,9 +1088,9 @@ func TestDeleteWritesToChangelog(t *testing.T) {
 func TestStreamReadStartsAfterSince(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3"})
 
 	// Read all events first.
 	all, err := r.StreamRead(context.Background(), "0", 10, 0)
@@ -1061,9 +1142,9 @@ func TestStreamInfoEmpty(t *testing.T) {
 func TestStreamInfoAfterMultipleWrites(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3"})
 
 	// Verify via StreamRead that 3 events exist.
 	events, err := r.StreamRead(context.Background(), "0", 10, 0)
@@ -1081,9 +1162,9 @@ func TestStreamInfoAfterMultipleWrites(t *testing.T) {
 func TestStreamTrim(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3"})
 
 	all, _ := r.StreamRead(context.Background(), "0", 10, 0)
 	if len(all) != 3 {
@@ -1109,9 +1190,9 @@ func TestStreamTrim(t *testing.T) {
 func TestScanEntitiesBasic(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2", "P4947:100"})
-	w.UpsertEntity("Q3", []string{"P4947:200"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2", "P4947:100"})
+	testUpsertEntity(t, w, "Q3", []string{"P4947:200"})
 
 	var allEntities []SnapshotEntity
 	var cursor uint64
@@ -1160,7 +1241,7 @@ func TestScanEntitiesEmpty(t *testing.T) {
 func TestScanEntitiesPreservesMappings(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q42", []string{"P345:tt42", "P4947:42", "P4835:420"})
+	testUpsertEntity(t, w, "Q42", []string{"P345:tt42", "P4947:42", "P4835:420"})
 
 	entities, _, err := r.ScanEntities(context.Background(), 0, 100)
 	if err != nil {
@@ -1185,7 +1266,7 @@ func TestScanEntitiesPreservesMappings(t *testing.T) {
 func TestNewReaderFromWriter(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	r := NewReaderFromWriter(w)
 	result, err := r.LookupByProperty(345, "tt1")
@@ -1380,7 +1461,7 @@ func TestDeleteNonExistentEntity(t *testing.T) {
 	w, _ := newTestSetup(t)
 
 	// Should not error — skip silently.
-	if err := w.DeleteEntity("Q999999"); err != nil {
+	if err := testDeleteEntity(t, w, "Q999999"); err != nil {
 		t.Fatalf("DeleteEntity non-existent: %v", err)
 	}
 }
@@ -1388,7 +1469,7 @@ func TestDeleteNonExistentEntity(t *testing.T) {
 func TestDeleteNonExistentDoesNotWriteChangelog(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.DeleteEntity("Q999999")
+	testDeleteEntity(t, w, "Q999999")
 
 	_, _, length, err := r.StreamInfo()
 	if err != nil {
@@ -1403,7 +1484,7 @@ func TestUpsertIdenticalMappingsDoesNotWriteChangelog(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Initial upsert should write to changelog.
-	err := w.UpsertEntity("Q1", []string{"P345:tt1", "P4947:100"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -1417,7 +1498,7 @@ func TestUpsertIdenticalMappingsDoesNotWriteChangelog(t *testing.T) {
 	}
 
 	// Second upsert with identical mappings should NOT write to changelog.
-	err = w.UpsertEntity("Q1", []string{"P345:tt1", "P4947:100"})
+	err = testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity (no-op): %v", err)
 	}
@@ -1434,8 +1515,8 @@ func TestUpsertIdenticalMappingsDoesNotWriteChangelog(t *testing.T) {
 func TestUpsertChangedMappingsWritesChangelog(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q1", []string{"P345:tt1", "P4947:100"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4947:100"})
 
 	_, _, length, err := r.StreamInfo()
 	if err != nil {
@@ -1449,7 +1530,7 @@ func TestUpsertChangedMappingsWritesChangelog(t *testing.T) {
 func TestUpsertEntityWithEmptyMappings(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntity("Q1", []string{})
+	err := testUpsertEntity(t, w, "Q1", []string{})
 	if err != nil {
 		t.Fatalf("UpsertEntity empty mappings: %v", err)
 	}
@@ -1468,7 +1549,7 @@ func TestUpsertEntityWithNilMappings(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// nil and []string{} should behave identically: entity exists with empty mappings.
-	err := w.UpsertEntity("Q1", nil)
+	err := testUpsertEntity(t, w, "Q1", nil)
 	if err != nil {
 		t.Fatalf("UpsertEntity nil mappings: %v", err)
 	}
@@ -1495,7 +1576,7 @@ func TestUpsertThenClearMappings(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Create entity with mappings.
-	err := w.UpsertEntity("Q1", []string{"P345:tt1", "P4947:100"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P345:tt1", "P4947:100"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
@@ -1505,7 +1586,7 @@ func TestUpsertThenClearMappings(t *testing.T) {
 	}
 
 	// Update with empty mappings — should clear property indexes.
-	err = w.UpsertEntity("Q1", []string{})
+	err = testUpsertEntity(t, w, "Q1", []string{})
 	if err != nil {
 		t.Fatalf("UpsertEntity empty: %v", err)
 	}
@@ -1531,7 +1612,7 @@ func TestEmptyMappingsVsDelete(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Create entity with mappings.
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	stats, _ := r.GetStats()
 	if stats.EntityCount != 1 {
@@ -1539,7 +1620,7 @@ func TestEmptyMappingsVsDelete(t *testing.T) {
 	}
 
 	// Upsert with empty mappings: entity still exists, count unchanged.
-	w.UpsertEntity("Q1", []string{})
+	testUpsertEntity(t, w, "Q1", []string{})
 
 	stats, _ = r.GetStats()
 	if stats.EntityCount != 1 {
@@ -1556,7 +1637,7 @@ func TestEmptyMappingsVsDelete(t *testing.T) {
 	// the reader filters empty mappings, but entity_count proves it's there).
 
 	// Now delete: entity is truly gone, count decrements.
-	w.DeleteEntity("Q1")
+	testDeleteEntity(t, w, "Q1")
 
 	stats, _ = r.GetStats()
 	if stats.EntityCount != 0 {
@@ -1565,21 +1646,21 @@ func TestEmptyMappingsVsDelete(t *testing.T) {
 }
 
 func TestRecordFailedEntityIncrementsAttempts(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	err := w.RecordFailedEntity("Q1", "timeout")
+	err := testRecordFailedEntity(t, w, "Q1", "timeout")
 	if err != nil {
 		t.Fatalf("RecordFailedEntity first: %v", err)
 	}
 
 	// Record again — should increment attempts.
-	err = w.RecordFailedEntity("Q1", "connection refused")
+	err = testRecordFailedEntity(t, w, "Q1", "connection refused")
 	if err != nil {
 		t.Fatalf("RecordFailedEntity second: %v", err)
 	}
 
 	// Should still show as 1 entry.
-	failed, err := w.LastFailedEntities(10)
+	failed, err := r.LastFailedEntities(10)
 	if err != nil {
 		t.Fatalf("LastFailedEntities: %v", err)
 	}
@@ -1589,21 +1670,21 @@ func TestRecordFailedEntityIncrementsAttempts(t *testing.T) {
 }
 
 func TestRecordFailedEntityRotatesToBack(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
 	// Q1 fails first, then Q2, then Q3.
-	if err := w.RecordFailedEntity("Q1", "err"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q1", "err"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.RecordFailedEntity("Q2", "err"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q2", "err"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.RecordFailedEntity("Q3", "err"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q3", "err"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Q1 should be at front (oldest).
-	first, err := w.LastFailedEntities(1)
+	first, err := r.LastFailedEntities(1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1612,12 +1693,12 @@ func TestRecordFailedEntityRotatesToBack(t *testing.T) {
 	}
 
 	// Q1 fails again — should rotate to the back.
-	if err := w.RecordFailedEntity("Q1", "still failing"); err != nil {
+	if err := testRecordFailedEntity(t, w, "Q1", "still failing"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now Q2 should be at front (Q1 moved to back).
-	first, err = w.LastFailedEntities(1)
+	first, err = r.LastFailedEntities(1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1626,7 +1707,7 @@ func TestRecordFailedEntityRotatesToBack(t *testing.T) {
 	}
 
 	// All three still present.
-	all, err := w.LastFailedEntities(10)
+	all, err := r.LastFailedEntities(10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1638,55 +1719,43 @@ func TestRecordFailedEntityRotatesToBack(t *testing.T) {
 func TestEnqueueEntitiesEmpty(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	n, err := w.EnqueueEntities(nil)
+	err := testEnqueueEntities(t, w, nil)
 	if err != nil {
 		t.Fatalf("EnqueueEntities(nil): %v", err)
 	}
-	if n != 0 {
-		t.Errorf("inserted = %d, want 0", n)
-	}
 
-	n, err = w.EnqueueEntities([]string{})
+	err = testEnqueueEntities(t, w, []string{})
 	if err != nil {
 		t.Fatalf("EnqueueEntities(empty): %v", err)
-	}
-	if n != 0 {
-		t.Errorf("inserted = %d, want 0", n)
 	}
 }
 
 func TestAckProcessedEntitiesEmpty(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	if err := w.AckProcessedEntities(nil); err != nil {
+	if err := testAckProcessedEntities(t, w, nil); err != nil {
 		t.Fatalf("AckProcessedEntities(nil): %v", err)
 	}
-	if err := w.AckProcessedEntities([]string{}); err != nil {
+	if err := testAckProcessedEntities(t, w, []string{}); err != nil {
 		t.Fatalf("AckProcessedEntities(empty): %v", err)
 	}
 }
 
 func TestEnqueueEntitiesDeduplication(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	n, err := w.EnqueueEntities([]string{"Q1", "Q2", "Q3"})
+	err := testEnqueueEntities(t, w, []string{"Q1", "Q2", "Q3"})
 	if err != nil {
 		t.Fatalf("first EnqueueEntities: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("first insert = %d, want 3", n)
-	}
 
 	// Re-enqueue overlapping set.
-	n, err = w.EnqueueEntities([]string{"Q2", "Q3", "Q4"})
+	err = testEnqueueEntities(t, w, []string{"Q2", "Q3", "Q4"})
 	if err != nil {
 		t.Fatalf("second EnqueueEntities: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("second insert = %d, want 1 (only Q4 is new)", n)
-	}
 
-	count, _ := w.PendingCount()
+	count, _ := r.PendingCount()
 	if count != 4 {
 		t.Errorf("PendingCount = %d, want 4", count)
 	}
@@ -1695,12 +1764,12 @@ func TestEnqueueEntitiesDeduplication(t *testing.T) {
 func TestUpsertInvalidQID(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	err := w.UpsertEntity("INVALID", []string{})
+	err := testUpsertEntity(t, w, "INVALID", []string{})
 	if err == nil {
 		t.Error("expected error for invalid QID")
 	}
 
-	err = w.UpsertEntity("", []string{})
+	err = testUpsertEntity(t, w, "", []string{})
 	if err == nil {
 		t.Error("expected error for empty QID")
 	}
@@ -1709,7 +1778,7 @@ func TestUpsertInvalidQID(t *testing.T) {
 func TestDeleteInvalidQID(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	err := w.DeleteEntity("INVALID")
+	err := testDeleteEntity(t, w, "INVALID")
 	if err == nil {
 		t.Error("expected error for invalid QID in delete")
 	}
@@ -1718,7 +1787,7 @@ func TestDeleteInvalidQID(t *testing.T) {
 func TestEnqueueInvalidQID(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	_, err := w.EnqueueEntities([]string{"INVALID"})
+	err := testEnqueueEntities(t, w, []string{"INVALID"})
 	if err == nil {
 		t.Error("expected error for invalid QID in enqueue")
 	}
@@ -1727,17 +1796,17 @@ func TestEnqueueInvalidQID(t *testing.T) {
 func TestAckProcessedInvalidQID(t *testing.T) {
 	w, _ := newTestSetup(t)
 
-	err := w.AckProcessedEntities([]string{"INVALID"})
+	err := testAckProcessedEntities(t, w, []string{"INVALID"})
 	if err == nil {
 		t.Error("expected error for invalid QID in ack processed")
 	}
 }
 
 func TestRecoverProcessing(t *testing.T) {
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
 	// Enqueue 3, claim 2 (moves them to processing).
-	w.EnqueueEntities([]string{"Q1", "Q2", "Q3"})
+	testEnqueueEntities(t, w, []string{"Q1", "Q2", "Q3"})
 	claimed, err := w.ClaimPendingBatch(2)
 	if err != nil {
 		t.Fatalf("ClaimPendingBatch: %v", err)
@@ -1747,7 +1816,7 @@ func TestRecoverProcessing(t *testing.T) {
 	}
 
 	// Simulate crash: pending has 1, processing has 2.
-	count, _ := w.PendingCount()
+	count, _ := r.PendingCount()
 	if count != 1 {
 		t.Fatalf("PendingCount before recover = %d, want 1", count)
 	}
@@ -1757,14 +1826,14 @@ func TestRecoverProcessing(t *testing.T) {
 		t.Fatalf("RecoverProcessing: %v", err)
 	}
 
-	count, _ = w.PendingCount()
+	count, _ = r.PendingCount()
 	if count != 3 {
 		t.Errorf("PendingCount after recover = %d, want 3", count)
 	}
 
 	// Claim new entity added during processing is preserved.
-	w.EnqueueEntities([]string{"Q4"})
-	count, _ = w.PendingCount()
+	testEnqueueEntities(t, w, []string{"Q4"})
+	count, _ = r.PendingCount()
 	if count != 4 {
 		t.Errorf("PendingCount after adding Q4 = %d, want 4", count)
 	}
@@ -1773,9 +1842,9 @@ func TestRecoverProcessing(t *testing.T) {
 func TestClaimAllowsReEnqueue(t *testing.T) {
 	// This tests the race condition fix: once a QID is claimed (moved to
 	// processing), a new SADD for the same QID should succeed in pending.
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	w.EnqueueEntities([]string{"Q42"})
+	testEnqueueEntities(t, w, []string{"Q42"})
 
 	// Claim Q42 — moves it from pending to processing.
 	claimed, err := w.ClaimPendingBatch(10)
@@ -1787,27 +1856,24 @@ func TestClaimAllowsReEnqueue(t *testing.T) {
 	}
 
 	// Pending should be empty now.
-	count, _ := w.PendingCount()
+	count, _ := r.PendingCount()
 	if count != 0 {
 		t.Fatalf("PendingCount after claim = %d, want 0", count)
 	}
 
 	// Re-enqueue Q42 (simulates a new event arriving during processing).
-	n, err := w.EnqueueEntities([]string{"Q42"})
+	err = testEnqueueEntities(t, w, []string{"Q42"})
 	if err != nil {
 		t.Fatalf("re-EnqueueEntities: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("re-enqueue inserted = %d, want 1 (Q42 should be addable)", n)
-	}
 
 	// Ack the original claim.
-	if err := w.AckProcessedEntities(claimed); err != nil {
+	if err := testAckProcessedEntities(t, w, claimed); err != nil {
 		t.Fatalf("AckProcessedEntities: %v", err)
 	}
 
 	// Q42 should still be in pending for the next cycle.
-	count, _ = w.PendingCount()
+	count, _ = r.PendingCount()
 	if count != 1 {
 		t.Errorf("PendingCount after ack = %d, want 1", count)
 	}
@@ -1815,17 +1881,17 @@ func TestClaimAllowsReEnqueue(t *testing.T) {
 
 func TestRequeueAfterClaim(t *testing.T) {
 	// Simulates requeueOnFailure: claim a batch, then re-enqueue + ack.
-	w, _ := newTestSetup(t)
+	w, r := newTestSetup(t)
 
-	w.EnqueueEntities([]string{"Q1", "Q2", "Q3"})
+	testEnqueueEntities(t, w, []string{"Q1", "Q2", "Q3"})
 	claimed, _ := w.ClaimPendingBatch(2)
 
 	// Re-enqueue the claimed batch (simulates batch failure).
-	w.EnqueueEntities(claimed)
-	w.AckProcessedEntities(claimed)
+	testEnqueueEntities(t, w, claimed)
+	testAckProcessedEntities(t, w, claimed)
 
 	// All 3 should be back in pending.
-	count, _ := w.PendingCount()
+	count, _ := r.PendingCount()
 	if count != 3 {
 		t.Errorf("PendingCount after requeue = %d, want 3", count)
 	}
@@ -1834,7 +1900,7 @@ func TestRequeueAfterClaim(t *testing.T) {
 func TestMultipleEntityBatchChangelogEvents(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	err := w.UpsertEntitiesBatch([]EntityRecord{
+	err := testUpsertEntitiesBatch(t, w, []EntityRecord{
 		{WikidataID: "Q1", Mappings: []string{"P345:tt1"}},
 		{WikidataID: "Q2", Mappings: []string{"P345:tt2"}},
 		{WikidataID: "Q3", Mappings: []string{"P345:tt3"}},
@@ -1869,14 +1935,14 @@ func TestMultipleEntityBatchChangelogEvents(t *testing.T) {
 func TestDeleteBatchWritesChangelogPerEntity(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
 
 	// Get stream position after upserts.
 	all, _ := r.StreamRead(context.Background(), "0", 10, 0)
 	lastUpsertID := all[len(all)-1].ID
 
-	w.DeleteEntitiesBatch([]string{"Q1", "Q2"})
+	testDeleteEntitiesBatch(t, w, []string{"Q1", "Q2"})
 
 	events, err := r.StreamRead(context.Background(), lastUpsertID, 10, 0)
 	if err != nil {
@@ -1895,16 +1961,16 @@ func TestDeleteBatchWritesChangelogPerEntity(t *testing.T) {
 func TestEntityCountAfterDeleteBatch(t *testing.T) {
 	w, r := newTestSetup(t)
 
-	w.UpsertEntity("Q1", []string{"P345:tt1"})
-	w.UpsertEntity("Q2", []string{"P345:tt2"})
-	w.UpsertEntity("Q3", []string{"P345:tt3"})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2"})
+	testUpsertEntity(t, w, "Q3", []string{"P345:tt3"})
 
 	stats, _ := r.GetStats()
 	if stats.EntityCount != 3 {
 		t.Errorf("initial EntityCount = %d, want 3", stats.EntityCount)
 	}
 
-	w.DeleteEntitiesBatch([]string{"Q1", "Q3"})
+	testDeleteEntitiesBatch(t, w, []string{"Q1", "Q3"})
 	stats, _ = r.GetStats()
 	if stats.EntityCount != 1 {
 		t.Errorf("after delete EntityCount = %d, want 1", stats.EntityCount)
@@ -1930,16 +1996,16 @@ func TestIsStreamNotFoundError(t *testing.T) {
 }
 
 func TestNoChangelogUpsert(t *testing.T) {
-	w := newTestWriter(t)
+	w, r := newTestSetup(t)
 	w.SetNoChangelog(true)
 
-	err := w.UpsertEntity("Q42", []string{"P213:abc"})
+	err := testUpsertEntity(t, w, "Q42", []string{"P213:abc"})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
 	// Entity should exist.
-	val, err := w.GetSyncState("entity_count")
+	val, err := r.GetSyncState("entity_count")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -1961,13 +2027,13 @@ func TestNoChangelogDelete(t *testing.T) {
 	w := newTestWriter(t)
 
 	// Insert with changelog first.
-	if err := w.UpsertEntity("Q42", []string{"P213:abc"}); err != nil {
+	if err := testUpsertEntity(t, w, "Q42", []string{"P213:abc"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
 	// Now disable and delete.
 	w.SetNoChangelog(true)
-	if err := w.DeleteEntity("Q42"); err != nil {
+	if err := testDeleteEntity(t, w, "Q42"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -1985,16 +2051,16 @@ func TestNoChangelogDelete(t *testing.T) {
 }
 
 func TestNoChangelogUpsertStillDiffsIndexes(t *testing.T) {
-	w := newTestWriter(t)
+	w, r := newTestSetup(t)
 	w.SetNoChangelog(true)
 
 	// Insert entity with one mapping.
-	if err := w.UpsertEntity("Q42", []string{"P213:old"}); err != nil {
+	if err := testUpsertEntity(t, w, "Q42", []string{"P213:old"}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
 
 	// Update with different mapping.
-	if err := w.UpsertEntity("Q42", []string{"P213:new"}); err != nil {
+	if err := testUpsertEntity(t, w, "Q42", []string{"P213:new"}); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
 
@@ -2013,7 +2079,7 @@ func TestNoChangelogUpsertStillDiffsIndexes(t *testing.T) {
 	}
 
 	// entity_count should still be 1.
-	val, _ := w.GetSyncState("entity_count")
+	val, _ := r.GetSyncState("entity_count")
 	if val != "1" {
 		t.Errorf("entity_count = %q, want 1", val)
 	}
@@ -2025,14 +2091,14 @@ func TestUpsertDrainRemainingNew(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Start with one mapping whose key sorts first.
-	err := w.UpsertEntity("Q1", []string{"P1:a"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P1:a"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
 	// Update: keep the old mapping and add two that sort after it.
 	// After the equal match on P1:a, the merge-walk drains P2:b and P3:c.
-	err = w.UpsertEntity("Q1", []string{"P1:a", "P2:b", "P3:c"})
+	err = testUpsertEntity(t, w, "Q1", []string{"P1:a", "P2:b", "P3:c"})
 	if err != nil {
 		t.Fatalf("UpsertEntity (drain new): %v", err)
 	}
@@ -2055,14 +2121,14 @@ func TestUpsertDrainRemainingOld(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Start with three mappings.
-	err := w.UpsertEntity("Q1", []string{"P1:a", "P2:b", "P3:c"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P1:a", "P2:b", "P3:c"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
 	// Update: keep only the first. After the equal match on P1:a,
 	// the merge-walk drains P2:b and P3:c from old.
-	err = w.UpsertEntity("Q1", []string{"P1:a"})
+	err = testUpsertEntity(t, w, "Q1", []string{"P1:a"})
 	if err != nil {
 		t.Fatalf("UpsertEntity (drain old): %v", err)
 	}
@@ -2093,13 +2159,13 @@ func TestUpsertCompleteReplacement(t *testing.T) {
 	w, r := newTestSetup(t)
 
 	// Start with mappings that all sort before the replacements.
-	err := w.UpsertEntity("Q1", []string{"P1:x", "P2:y"})
+	err := testUpsertEntity(t, w, "Q1", []string{"P1:x", "P2:y"})
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
 	// Replace with entirely different mappings that sort after.
-	err = w.UpsertEntity("Q1", []string{"P3:a", "P4:b"})
+	err = testUpsertEntity(t, w, "Q1", []string{"P3:a", "P4:b"})
 	if err != nil {
 		t.Fatalf("UpsertEntity (replace): %v", err)
 	}

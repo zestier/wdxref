@@ -46,12 +46,13 @@ type recentChangeEvent struct {
 type EventStreamWatcher struct {
 	processor  *Processor
 	writer     *store.Writer
+	reader     *store.Reader
 	httpClient *http.Client
 	streamURL  string
 }
 
 // NewEventStreamWatcher creates a new EventStreams watcher.
-func NewEventStreamWatcher(processor *Processor, writer *store.Writer, httpClient *http.Client) *EventStreamWatcher {
+func NewEventStreamWatcher(processor *Processor, writer *store.Writer, reader *store.Reader, httpClient *http.Client) *EventStreamWatcher {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout: 0, // No timeout for SSE
@@ -60,6 +61,7 @@ func NewEventStreamWatcher(processor *Processor, writer *store.Writer, httpClien
 	return &EventStreamWatcher{
 		processor:  processor,
 		writer:     writer,
+		reader:     reader,
 		httpClient: httpClient,
 		streamURL:  eventStreamURL,
 	}
@@ -123,7 +125,7 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) (retErr erro
 	// gap check below.
 	var sinceTime time.Time
 
-	lastEventID, err := w.writer.GetSyncState("last_event_id")
+	lastEventID, err := w.reader.GetSyncState("last_event_id")
 	if err != nil {
 		return fmt.Errorf("get last_event_id: %w", err)
 	}
@@ -131,7 +133,7 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) (retErr erro
 	if lastEventID != "" {
 		sinceTime = extractEventIDTime(lastEventID)
 	} else {
-		dumpTime, err := w.writer.GetSyncState("dump_time")
+		dumpTime, err := w.reader.GetSyncState("dump_time")
 		if err != nil {
 			return fmt.Errorf("get dump_time: %w", err)
 		}
@@ -198,16 +200,15 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) (retErr erro
 			for qid := range batchSet {
 				batch = append(batch, qid)
 			}
-			n, err := w.writer.EnqueueEntities(batch)
-			if err != nil {
+			p := w.writer.NewPipe(context.Background())
+			p.EnqueueEntities(batch)
+			if batchLastEventID != "" {
+				p.SetSyncState("last_event_id", batchLastEventID)
+			}
+			if err := p.Exec(); err != nil {
 				return fmt.Errorf("enqueue entities: %w", err)
 			}
-			if batchLastEventID != "" {
-				if err := w.writer.SetSyncState("last_event_id", batchLastEventID); err != nil {
-					return fmt.Errorf("persist last_event_id: %w", err)
-				}
-			}
-			slog.Info("enqueued entities", "count", len(batch), "new", n)
+			slog.Info("enqueued entities", "count", len(batch))
 			clear(batchSet)
 			batchLastEventID = ""
 			return nil
@@ -293,7 +294,9 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) (retErr erro
 					gap := eventTime.Sub(sinceTime)
 					if gap > streamGapThreshold {
 						slog.Warn("stream gap detected", "since", sinceTime.Format(time.RFC3339), "first_event", eventTime.Format(time.RFC3339), "gap", gap)
-						if err := w.writer.ClearSyncCursors(); err != nil {
+						p := w.writer.NewPipe(context.Background())
+						p.DelSyncStates("dump_time", "last_event_id")
+						if err := p.Exec(); err != nil {
 							slog.Error("failed to clear sync cursors", "error", err)
 						}
 						return ErrStreamTooOld
@@ -510,17 +513,16 @@ func (w *EventStreamWatcher) handleBatchResult(ctx context.Context, qids []strin
 		return false
 	}
 
+	p := w.writer.NewPipe(context.Background())
 	for _, qid := range qids {
 		if perr := perEntityErrors[qid]; perr != nil {
 			slog.Error("error processing entity", "qid", qid, "error", perr)
-			if dlErr := w.writer.RecordFailedEntity(qid, perr.Error()); dlErr != nil {
-				slog.Error("failed to record failed entity", "qid", qid, "error", dlErr)
-			}
+			p.RecordFailedEntity(qid, perr.Error())
 		}
 	}
-
-	if err := w.writer.AckProcessedEntities(qids); err != nil {
-		slog.Error("error acking processed entities", "error", err)
+	p.AckProcessedEntities(qids)
+	if err := p.Exec(); err != nil {
+		slog.Error("failed to record failures / ack processed entities", "error", err)
 	}
 
 	return true
@@ -532,12 +534,11 @@ func (w *EventStreamWatcher) requeueOnFailure(qids []string) {
 	if len(qids) == 0 {
 		return
 	}
-	if _, err := w.writer.EnqueueEntities(qids); err != nil {
+	p := w.writer.NewPipe(context.Background())
+	p.EnqueueEntities(qids)
+	p.AckProcessedEntities(qids)
+	if err := p.Exec(); err != nil {
 		slog.Error("failed to re-enqueue entities after batch failure", "error", err)
-		return
-	}
-	if err := w.writer.AckProcessedEntities(qids); err != nil {
-		slog.Error("failed to ack re-enqueued entities", "error", err)
 	}
 }
 
@@ -551,7 +552,7 @@ func (w *EventStreamWatcher) retryFailedEntities(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			qids, err := w.writer.LastFailedEntities(retryBatchSize)
+			qids, err := w.reader.LastFailedEntities(retryBatchSize)
 			if err != nil {
 				slog.Error("failed to read failed entities", "error", err)
 				continue
@@ -569,16 +570,16 @@ func (w *EventStreamWatcher) retryFailedEntities(ctx context.Context) {
 			}
 
 			for _, qid := range qids {
+				p := w.writer.NewPipe(context.Background())
 				if perr := perEntityErrors[qid]; perr != nil {
 					slog.Error("retry failed", "qid", qid, "error", perr)
-					if dlErr := w.writer.RecordFailedEntity(qid, perr.Error()); dlErr != nil {
-						slog.Error("failed to update failed entity", "qid", qid, "error", dlErr)
-					}
+					p.RecordFailedEntity(qid, perr.Error())
 				} else {
 					slog.Info("retry succeeded", "qid", qid)
-					if err := w.writer.DeleteFailedEntity(qid); err != nil {
-						slog.Error("failed to remove retry record", "qid", qid, "error", err)
-					}
+					p.DeleteFailedEntity(qid)
+				}
+				if err := p.Exec(); err != nil {
+					slog.Error("failed to update retry record", "qid", qid, "error", err)
 				}
 			}
 		}

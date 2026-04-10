@@ -43,7 +43,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	replicaClient := replica.NewClient(writer, client.Redis(), upstreamURL)
+	reader := store.NewReader(client)
+
+	replicaClient := replica.NewClient(writer, reader, client.Redis(), upstreamURL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -43,18 +43,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	reader := store.NewReader(client)
+
 	httpClient := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
 	wikidataClient := watcher.NewWikidataClient(httpClient)
 
 	processor := watcher.NewProcessor(writer, wikidataClient)
 	dumpClient := &http.Client{Timeout: 0, Transport: transport}
-	seeder := watcher.NewSeeder(writer, dumpClient, watcher.DumpFormat(os.Getenv("DUMP_FORMAT")))
+	seeder := watcher.NewSeeder(writer, reader, dumpClient, watcher.DumpFormat(os.Getenv("DUMP_FORMAT")))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	sseClient := &http.Client{Timeout: 0, Transport: transport}
-	esWatcher := watcher.NewEventStreamWatcher(processor, writer, sseClient)
+	esWatcher := watcher.NewEventStreamWatcher(processor, writer, reader, sseClient)
 
 	for {
 		needsSeed, err := seeder.NeedsSeed()
@@ -76,7 +78,9 @@ func main() {
 			slog.Info("database is up to date, skipping seed")
 		}
 
-		if err := writer.SetSyncState("state", "streaming"); err != nil {
+		p := writer.NewPipe(context.Background())
+		p.SetSyncState("state", "streaming")
+		if err := p.Exec(); err != nil {
 			slog.Error("failed to set state", "error", err)
 			os.Exit(1)
 		}

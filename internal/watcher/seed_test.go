@@ -23,7 +23,7 @@ import (
 	"github.com/ekeid/ekeid/internal/store"
 )
 
-func newTestStoreWriter(t *testing.T) *store.Writer {
+func newTestStoreWriter(t *testing.T) (*store.Writer, *store.Reader) {
 	t.Helper()
 	s := miniredis.RunT(t)
 	c, err := store.NewClient(s.Addr())
@@ -35,7 +35,28 @@ func newTestStoreWriter(t *testing.T) *store.Writer {
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
-	return w
+	r := store.NewReaderFromWriter(w)
+	return w, r
+}
+
+// testWriterUpsertEntity is a test helper that wraps Pipe for convenience.
+func testWriterUpsertEntity(t *testing.T, w *store.Writer, wikidataID string, mappings []string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.UpsertEntity(store.EntityRecord{WikidataID: wikidataID, Mappings: mappings})
+	if err := p.Exec(); err != nil {
+		t.Fatalf("UpsertEntity(%s): %v", wikidataID, err)
+	}
+}
+
+// testWriterSetSyncState is a test helper that wraps Pipe for convenience.
+func testWriterSetSyncState(t *testing.T, w *store.Writer, key, value string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.SetSyncState(key, value)
+	if err := p.Exec(); err != nil {
+		t.Fatalf("SetSyncState(%s): %v", key, err)
+	}
 }
 
 func withDumpWriteRetryDelay(t *testing.T, fn func(int) time.Duration) {
@@ -252,7 +273,7 @@ func compressGZ(t *testing.T, data []byte) []byte {
 }
 
 func TestProcessDumpStream(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -271,7 +292,7 @@ func TestProcessDumpStream(t *testing.T) {
 	dumpData.Write(tv)
 	dumpData.WriteString("\n]\n")
 
-	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatGZ)
 	imported, lines, err := seeder.processDumpStream(context.Background(), &dumpData, 0, nil)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
@@ -282,8 +303,6 @@ func TestProcessDumpStream(t *testing.T) {
 	if lines < 4 {
 		t.Errorf("lines = %d, want >= 4", lines)
 	}
-
-	reader := store.NewReaderFromWriter(writer)
 
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
@@ -309,7 +328,7 @@ func TestProcessDumpStream(t *testing.T) {
 }
 
 func TestProcessDumpStreamBZ2(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -324,7 +343,7 @@ func TestProcessDumpStreamBZ2(t *testing.T) {
 	compressed := compressBZ2(t, dumpData.Bytes())
 	decompressed := bzip2.NewReader(bytes.NewReader(compressed))
 
-	seeder := NewSeeder(writer, nil, DumpFormatBZ2)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatBZ2)
 	imported, _, err := seeder.processDumpStream(context.Background(), decompressed, 0, nil)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
@@ -335,7 +354,7 @@ func TestProcessDumpStreamBZ2(t *testing.T) {
 }
 
 func TestProcessDumpStreamGZ(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -348,14 +367,14 @@ func TestProcessDumpStreamGZ(t *testing.T) {
 	dumpData.WriteString("\n]\n")
 
 	compressed := compressGZ(t, dumpData.Bytes())
-	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	gzr, err := gzip.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
+	defer gzr.Close()
 
-	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	imported, _, err := seeder.processDumpStream(context.Background(), reader, 0, nil)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatGZ)
+	imported, _, err := seeder.processDumpStream(context.Background(), gzr, 0, nil)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -378,6 +397,7 @@ func TestProcessDumpStream_ReturnsBackgroundWriterError(t *testing.T) {
 	if err := writer.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	reader := store.NewReaderFromWriter(writer)
 
 	// Force the write path to fail after setup but before the seed flush runs.
 	s.Close()
@@ -391,7 +411,7 @@ func TestProcessDumpStream_ReturnsBackgroundWriterError(t *testing.T) {
 	dumpData.Write(movie)
 	dumpData.WriteString("\n]\n")
 
-	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatGZ)
 	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil)
 	if err == nil {
 		t.Fatal("expected background writer error, got nil")
@@ -419,6 +439,7 @@ func TestProcessDumpStream_RetriesSeedBatchWrite(t *testing.T) {
 	if err := writer.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	reader := store.NewReaderFromWriter(writer)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345": "tt0111161",
@@ -438,7 +459,7 @@ func TestProcessDumpStream_RetriesSeedBatchWrite(t *testing.T) {
 		s.SetError("")
 	}()
 
-	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatGZ)
 	imported, _, err := seeder.processDumpStream(context.Background(), &dumpData, 0, nil)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
@@ -450,7 +471,6 @@ func TestProcessDumpStream_RetriesSeedBatchWrite(t *testing.T) {
 		t.Fatal("expected at least one retry before seed batch succeeded")
 	}
 
-	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
@@ -490,6 +510,7 @@ func TestProcessDumpStream_CancelledDuringRetryDelay(t *testing.T) {
 	if err := writer.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	reader := store.NewReaderFromWriter(writer)
 
 	s.SetError("transient write failure")
 
@@ -510,7 +531,7 @@ func TestProcessDumpStream_CancelledDuringRetryDelay(t *testing.T) {
 		cancel()
 	}()
 
-	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, nil, DumpFormatGZ)
 	start := time.Now()
 	_, _, err = seeder.processDumpStream(ctx, &dumpData, 0, nil)
 	if !errors.Is(err, context.Canceled) {
@@ -522,7 +543,7 @@ func TestProcessDumpStream_CancelledDuringRetryDelay(t *testing.T) {
 }
 
 func TestSeederSeedWithMockServer(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -544,15 +565,13 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 	}))
 	defer server.Close()
 
-	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, server.Client(), DumpFormatGZ)
 	withStaticDumpLocator(seeder, server.URL, dumpTime.UTC().Format("20060102"))
 
 	err := seeder.Seed(context.Background())
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
-
-	reader := store.NewReaderFromWriter(writer)
 
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
@@ -566,7 +585,7 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 	}
 
 	// Verify sync timestamps
-	state, err := writer.GetSyncState("state")
+	state, err := reader.GetSyncState("state")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -574,7 +593,7 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 		t.Errorf("state = %q, want seeding", state)
 	}
 
-	dumpTimeStr, err := writer.GetSyncState("dump_time")
+	dumpTimeStr, err := reader.GetSyncState("dump_time")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -583,7 +602,7 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 		t.Errorf("dump_time = %q, want %q", dumpTimeStr, expectedDumpTime)
 	}
 
-	configHash, err := writer.GetSyncState("config_hash")
+	configHash, err := reader.GetSyncState("config_hash")
 	if err != nil {
 		t.Fatalf("GetSyncState config_hash: %v", err)
 	}
@@ -593,9 +612,9 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 }
 
 func TestSeederNeedsSeed(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
-	seeder := NewSeeder(writer, nil, "")
+	seeder := NewSeeder(writer, reader, nil, "")
 
 	// Empty DB should need seed
 	needs, err := seeder.NeedsSeed()
@@ -607,8 +626,8 @@ func TestSeederNeedsSeed(t *testing.T) {
 	}
 
 	// Recent sync with current config should not need seed
-	writer.SetSyncState("dump_time", "2026-03-11T00:00:00Z")
-	writer.SetSyncState("config_hash", configFingerprint())
+	testWriterSetSyncState(t, writer, "dump_time", "2026-03-11T00:00:00Z")
+	testWriterSetSyncState(t, writer, "config_hash", configFingerprint())
 	needs, err = seeder.NeedsSeed()
 	if err != nil {
 		t.Fatalf("NeedsSeed: %v", err)
@@ -618,7 +637,7 @@ func TestSeederNeedsSeed(t *testing.T) {
 	}
 
 	// Stale config hash should trigger reseed
-	writer.SetSyncState("config_hash", "stale-hash")
+	testWriterSetSyncState(t, writer, "config_hash", "stale-hash")
 	needs, err = seeder.NeedsSeed()
 	if err != nil {
 		t.Fatalf("NeedsSeed: %v", err)
@@ -629,7 +648,7 @@ func TestSeederNeedsSeed(t *testing.T) {
 }
 
 func TestSeederUsesInjectedLocator(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Build a minimal dump
 	movie := buildDumpEntityJSON("Q1", "Test", map[string]string{"P345": "tt0000001"})
@@ -647,7 +666,7 @@ func TestSeederUsesInjectedLocator(t *testing.T) {
 	defer server.Close()
 
 	// Create seeder and inject custom locator
-	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, server.Client(), DumpFormatGZ)
 	locatorCalled := atomic.Bool{}
 	seeder.dumpLocator = func(ctx context.Context) (string, string, bool) {
 		locatorCalled.Store(true)
@@ -667,7 +686,7 @@ func TestSeederUsesInjectedLocator(t *testing.T) {
 }
 
 func TestSeederSeedServerError(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -675,7 +694,7 @@ func TestSeederSeedServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	seeder := NewSeeder(writer, server.Client(), DumpFormatBZ2)
+	seeder := NewSeeder(writer, reader, server.Client(), DumpFormatBZ2)
 	withStaticDumpLocator(seeder, server.URL, "20260310")
 
 	err := seeder.Seed(context.Background())
@@ -688,16 +707,10 @@ func TestSeederSeedServerError(t *testing.T) {
 }
 
 func TestSeederSeedFlushesExistingData(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Pre-populate an entity
-	err := writer.UpsertEntitiesBatch([]store.EntityRecord{{
-		WikidataID: "Q999999",
-		Mappings:   []string{"P345:tt9999999"},
-	}})
-	if err != nil {
-		t.Fatalf("UpsertEntitiesBatch: %v", err)
-	}
+	testWriterUpsertEntity(t, writer, "Q999999", []string{"P345:tt9999999"})
 
 	// Build dump with only one entity
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
@@ -720,15 +733,13 @@ func TestSeederSeedFlushesExistingData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, server.Client(), DumpFormatGZ)
 	withStaticDumpLocator(seeder, server.URL, dumpTime.UTC().Format("20060102"))
 
-	err = seeder.Seed(context.Background())
+	err := seeder.Seed(context.Background())
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
-
-	reader := store.NewReaderFromWriter(writer)
 
 	// The imported entity should exist
 	result, err := reader.LookupByProperty(345, "tt0111161")
@@ -864,7 +875,7 @@ func TestResumableBodyNoETagFallback(t *testing.T) {
 func TestSeederSeedResumesOnDrop(t *testing.T) {
 	withDumpResumeRetryDelay(t, func(int) time.Duration { return time.Millisecond })
 
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -914,7 +925,7 @@ func TestSeederSeedResumesOnDrop(t *testing.T) {
 	}))
 	defer server.Close()
 
-	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
+	seeder := NewSeeder(writer, reader, server.Client(), DumpFormatGZ)
 	withStaticDumpLocator(seeder, server.URL, dumpTime.UTC().Format("20060102"))
 
 	err := seeder.Seed(context.Background())
@@ -927,7 +938,6 @@ func TestSeederSeedResumesOnDrop(t *testing.T) {
 		t.Errorf("expected at least 2 requests (initial + resume), got %d", requestCount.Load())
 	}
 
-	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)

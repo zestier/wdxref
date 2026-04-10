@@ -32,11 +32,12 @@ func newTestClient(t *testing.T) (*Client, *miniredis.Miniredis, *redis.Client) 
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	r := store.NewReaderFromWriter(w)
 
 	rdb := redis.NewClient(&redis.Options{Addr: s.Addr(), Protocol: 2})
 	t.Cleanup(func() { rdb.Close() })
 
-	client := NewClient(w, rdb, "http://localhost")
+	client := NewClient(w, r, rdb, "http://localhost")
 	return client, s, rdb
 }
 
@@ -54,11 +55,37 @@ func xRangeAll(t *testing.T, rdb *redis.Client, stream string) []redis.XMessage 
 // applySnapshotEntity
 // ---------------------------------------------------------------------------
 
+// testApplySnapshotEntity is a test helper that replicates the old
+// applySnapshotEntity method removed during the Pipe refactor.
+func testApplySnapshotEntity(ctx context.Context, c *Client, qid int64, rawMappings string) error {
+	p := c.writer.NewPipe(ctx)
+	p.UpsertRawEntity(store.RawEntityRecord{
+		WikidataID:  fmt.Sprintf("Q%d", qid),
+		RawMappings: rawMappings,
+	})
+	return p.Exec()
+}
+
+// testApplyChange is a test helper that replicates the old applyChange method.
+func testApplyChange(ctx context.Context, c *Client, qid int64, rawMappings string) error {
+	p := c.writer.NewPipe(ctx)
+	qidStr := fmt.Sprintf("Q%d", qid)
+	if rawMappings != "" {
+		p.UpsertRawEntity(store.RawEntityRecord{
+			WikidataID:  qidStr,
+			RawMappings: rawMappings,
+		})
+	} else {
+		p.DeleteEntity(qidStr)
+	}
+	return p.Exec()
+}
+
 func TestApplySnapshotEntity_Basic(t *testing.T) {
 	c, s, rdb := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.applySnapshotEntity(ctx, 42, `["P213:abc123","P214:xyz"]`); err != nil {
+	if err := testApplySnapshotEntity(ctx, c, 42, `["P213:abc123","P214:xyz"]`); err != nil {
 		t.Fatalf("applySnapshotEntity: %v", err)
 	}
 
@@ -94,7 +121,7 @@ func TestApplySnapshotEntity_EmptyMappings(t *testing.T) {
 	c, _, _ := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.applySnapshotEntity(ctx, 1, "[]"); err != nil {
+	if err := testApplySnapshotEntity(ctx, c, 1, "[]"); err != nil {
 		t.Fatalf("applySnapshotEntity: %v", err)
 	}
 }
@@ -107,7 +134,7 @@ func TestApplyChange_UpsertNew(t *testing.T) {
 	c, s, rdb := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.applyChange(ctx, 99, `["P213:val1","P213:val2"]`); err != nil {
+	if err := testApplyChange(ctx, c, 99, `["P213:val1","P213:val2"]`); err != nil {
 		t.Fatalf("applyChange: %v", err)
 	}
 
@@ -143,12 +170,12 @@ func TestApplyChange_UpsertExisting(t *testing.T) {
 	ctx := context.Background()
 
 	// Create initial entity.
-	if err := c.applyChange(ctx, 50, `["P213:old_val"]`); err != nil {
+	if err := testApplyChange(ctx, c, 50, `["P213:old_val"]`); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
 
 	// Update entity with new mappings.
-	if err := c.applyChange(ctx, 50, `["P213:new_val","P214:extra"]`); err != nil {
+	if err := testApplyChange(ctx, c, 50, `["P213:new_val","P214:extra"]`); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
 
@@ -180,12 +207,12 @@ func TestApplyChange_Delete(t *testing.T) {
 	ctx := context.Background()
 
 	// Create entity first.
-	if err := c.applyChange(ctx, 77, `["P213:val1","P300:valA","P300:valB"]`); err != nil {
+	if err := testApplyChange(ctx, c, 77, `["P213:val1","P300:valA","P300:valB"]`); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
 	// Delete it.
-	if err := c.applyChange(ctx, 77, ""); err != nil {
+	if err := testApplyChange(ctx, c, 77, ""); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -218,7 +245,7 @@ func TestApplyChange_DeleteNonexistent(t *testing.T) {
 	c, _, _ := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.applyChange(ctx, 999, ""); err != nil {
+	if err := testApplyChange(ctx, c, 999, ""); err != nil {
 		t.Fatalf("delete nonexistent should be no-op, got: %v", err)
 	}
 }
@@ -228,7 +255,7 @@ func TestApplyChange_UnknownAction(t *testing.T) {
 	ctx := context.Background()
 
 	// upsert with empty array should not error.
-	if err := c.applyChange(ctx, 1, `[]`); err != nil {
+	if err := testApplyChange(ctx, c, 1, `[]`); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -303,7 +303,7 @@ func TestParseEntityJSON_InvalidJSON(t *testing.T) {
 }
 
 func TestProcessorWithMockServer(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	entityObj := buildTestEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -329,7 +329,6 @@ func TestProcessorWithMockServer(t *testing.T) {
 		t.Fatalf("ProcessEntity: %v", err)
 	}
 
-	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt0111161")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
@@ -397,7 +396,7 @@ func TestFetchEntitiesRaw_EmptyEntitiesReturnsError(t *testing.T) {
 // entities have external IDs and some don't produces the correct mix of
 // upserts (not deletes).
 func TestProcessEntities_BatchWithMixedResults(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Q1 has external IDs, Q2 has none, Q999 is missing.
 	q1Obj := buildTestEntityJSON("Q1", "Entity with IDs", map[string]string{
@@ -442,7 +441,6 @@ func TestProcessEntities_BatchWithMixedResults(t *testing.T) {
 		t.Errorf("Q999 should succeed (delete), got: %v", perErrors["Q999"])
 	}
 
-	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt1234567")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
@@ -456,12 +454,10 @@ func TestProcessEntities_BatchWithMixedResults(t *testing.T) {
 // from the API response (not returned at all, as opposed to returned with
 // a "missing" key) is treated as a per-entity error, not a delete.
 func TestProcessEntities_AbsentFromResponseIsError(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Seed Q50 first so we can verify it's NOT deleted.
-	if err := writer.UpsertEntity("Q50", []string{"P345:tt9999999"}); err != nil {
-		t.Fatalf("seed Q50: %v", err)
-	}
+	testWriterUpsertEntity(t, writer, "Q50", []string{"P345:tt9999999"})
 
 	// API response contains Q1 but not Q50 — simulates partial response.
 	q1Obj := buildTestEntityJSON("Q1", "Entity", map[string]string{"P345": "tt1"})
@@ -488,7 +484,6 @@ func TestProcessEntities_AbsentFromResponseIsError(t *testing.T) {
 	}
 
 	// Verify Q50 was NOT deleted.
-	reader := store.NewReaderFromWriter(writer)
 	result, err := reader.LookupByProperty(345, "tt9999999")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
@@ -504,13 +499,11 @@ func sseEvent(id string, data []byte) string {
 }
 
 func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Set last_sync to 30 days ago so the stream can't possibly go back that far.
 	oldDumpTime := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	if err := writer.SetSyncState("dump_time", oldDumpTime); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testWriterSetSyncState(t, writer, "dump_time", oldDumpTime)
 
 	// Create SSE server that sends one event with a recent timestamp.
 	recentTS := time.Now().Unix()
@@ -532,7 +525,7 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 	defer server.Close()
 
 	processor := NewProcessor(writer, nil)
-	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher := NewEventStreamWatcher(processor, writer, reader, server.Client())
 	esWatcher.streamURL = server.URL
 
 	ctx := context.Background()
@@ -543,7 +536,7 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 	}
 
 	// Verify dump_time was cleared.
-	dumpTime, err := writer.GetSyncState("dump_time")
+	dumpTime, err := reader.GetSyncState("dump_time")
 	if err != nil {
 		t.Fatalf("GetSyncState: %v", err)
 	}
@@ -553,14 +546,12 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 }
 
 func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
-	writer := newTestStoreWriter(t)
+	writer, reader := newTestStoreWriter(t)
 
 	// Set dump_time close to now so the requested sinceTime stays well within
 	// the 1h stream-gap threshold.
 	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
-	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testWriterSetSyncState(t, writer, "dump_time", recentDumpTime)
 
 	// SSE server sends one event with timestamp matching ~now, then closes.
 	eventData, _ := json.Marshal(map[string]interface{}{
@@ -579,7 +570,7 @@ func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
 	defer server.Close()
 
 	processor := NewProcessor(writer, nil)
-	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher := NewEventStreamWatcher(processor, writer, reader, server.Client())
 	esWatcher.streamURL = server.URL
 
 	ctx := context.Background()
@@ -606,11 +597,10 @@ func TestConnectAndProcess_EnqueueFailureReturnsError(t *testing.T) {
 	if err := writer.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	reader := store.NewReaderFromWriter(writer)
 
 	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
-	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testWriterSetSyncState(t, writer, "dump_time", recentDumpTime)
 
 	closed := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -636,7 +626,7 @@ func TestConnectAndProcess_EnqueueFailureReturnsError(t *testing.T) {
 	defer server.Close()
 
 	processor := NewProcessor(writer, nil)
-	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher := NewEventStreamWatcher(processor, writer, reader, server.Client())
 	esWatcher.streamURL = server.URL
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -666,11 +656,10 @@ func TestConnectAndProcess_FinalEnqueueFlushFailureReturnsError(t *testing.T) {
 	if err := writer.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
+	reader := store.NewReaderFromWriter(writer)
 
 	recentDumpTime := time.Now().Add(72*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
-	if err := writer.SetSyncState("dump_time", recentDumpTime); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testWriterSetSyncState(t, writer, "dump_time", recentDumpTime)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -691,7 +680,7 @@ func TestConnectAndProcess_FinalEnqueueFlushFailureReturnsError(t *testing.T) {
 	defer server.Close()
 
 	processor := NewProcessor(writer, nil)
-	esWatcher := NewEventStreamWatcher(processor, writer, server.Client())
+	esWatcher := NewEventStreamWatcher(processor, writer, reader, server.Client())
 	esWatcher.streamURL = server.URL
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

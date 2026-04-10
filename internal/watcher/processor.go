@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -84,15 +85,16 @@ func (p *Processor) ProcessEntities(qids []string) (map[string]error, error) {
 		})
 	}
 
-	if len(upserts) > 0 {
-		if err := p.writer.UpsertEntitiesBatch(upserts); err != nil {
-			return nil, fmt.Errorf("batch upsert: %w", err)
+	if len(upserts) > 0 || len(deletes) > 0 {
+		pipe := p.writer.NewPipe(context.Background())
+		for _, rec := range upserts {
+			pipe.UpsertEntity(rec)
 		}
-	}
-
-	if len(deletes) > 0 {
-		if err := p.writer.DeleteEntitiesBatch(deletes); err != nil {
-			return nil, fmt.Errorf("batch delete: %w", err)
+		for _, qid := range deletes {
+			pipe.DeleteEntity(qid)
+		}
+		if err := pipe.Exec(); err != nil {
+			return nil, fmt.Errorf("batch write: %w", err)
 		}
 	}
 

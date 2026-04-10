@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,10 +26,10 @@ const (
 
 // Writer provides read-write access to Kvrocks (used by the primary and replica).
 type Writer struct {
-	rdb          *redis.Client
-	noChangelog  bool
-	scriptsOnce  sync.Once
-	scriptsError error
+	rdb           *redis.Client
+	noChangelog   bool
+	scriptsMu     sync.Mutex
+	scriptsLoaded atomic.Bool
 }
 
 // Lua scripts executed atomically on the server.
@@ -162,17 +163,23 @@ func (w *Writer) noChangelogFlag() string {
 // loadScripts ensures all Lua scripts are loaded into the server cache.
 // This is necessary before using scripts in pipelines, which cannot
 // fallback from EVALSHA to EVAL automatically.
-// Scripts are loaded exactly once per Writer lifetime.
+// Scripts are loaded once and retried on subsequent calls if loading fails.
 func (w *Writer) loadScripts(ctx context.Context) error {
-	w.scriptsOnce.Do(func() {
-		for _, s := range []*redis.Script{upsertScript, deleteScript, recordFailedScript} {
-			if err := s.Load(ctx, w.rdb).Err(); err != nil {
-				w.scriptsError = fmt.Errorf("load lua script: %w", err)
-				return
-			}
+	if w.scriptsLoaded.Load() {
+		return nil
+	}
+	w.scriptsMu.Lock()
+	defer w.scriptsMu.Unlock()
+	if w.scriptsLoaded.Load() {
+		return nil
+	}
+	for _, s := range []*redis.Script{upsertScript, deleteScript, recordFailedScript} {
+		if err := s.Load(ctx, w.rdb).Err(); err != nil {
+			return fmt.Errorf("load lua script: %w", err)
 		}
-	})
-	return w.scriptsError
+	}
+	w.scriptsLoaded.Store(true)
+	return nil
 }
 
 // EntityRecord holds the data for a single entity upsert within a batch.
@@ -194,166 +201,206 @@ func scriptKeys() []string {
 	return []string{changelogKey}
 }
 
-// UpsertEntity inserts or updates an entity and its mappings.
-func (w *Writer) UpsertEntity(wikidataID string, mappings []string) error {
-	return w.UpsertEntitiesBatchContext(context.Background(), []EntityRecord{{
-		WikidataID: wikidataID,
-		Mappings:   mappings,
-	}})
+// Pipe wraps a Redis pipeline with store-level operations using a sticky
+// error pattern. All methods silently no-op after the first error.
+// Call Exec to flush the pipeline and return the first error, if any.
+type Pipe struct {
+	ctx  context.Context
+	pipe redis.Pipeliner
+	w    *Writer
+	err  error
 }
 
-// UpsertEntitiesBatch atomically inserts or updates multiple entities.
-// The changelog is only written when mappings change.
-func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
-	return w.UpsertEntitiesBatchContext(context.Background(), records)
-}
-
-// UpsertRawEntitiesBatch atomically inserts or updates multiple entities using
-// canonical mappings JSON already prepared by the caller.
-func (w *Writer) UpsertRawEntitiesBatch(records []RawEntityRecord) error {
-	return w.UpsertRawEntitiesBatchContext(context.Background(), records)
-}
-
-// UpsertEntitiesBatchContext atomically inserts or updates multiple entities
-// using the provided context.
-func (w *Writer) UpsertEntitiesBatchContext(ctx context.Context, records []EntityRecord) error {
-	if len(records) == 0 {
-		return nil
-	}
+// NewPipe creates a Pipe that queues store operations into a single Redis
+// pipeline round-trip. The caller must call Exec to flush.
+// If script loading fails, the error is captured in the Pipe and returned
+// by Exec, so callers never need to check NewPipe for errors.
+func (w *Writer) NewPipe(ctx context.Context) *Pipe {
+	p := &Pipe{ctx: ctx, w: w}
 	if err := w.loadScripts(ctx); err != nil {
-		return err
+		p.err = err
+		return p
 	}
-	pipe := w.rdb.Pipeline()
-
-	for _, rec := range records {
-		id, err := qidToInt(rec.WikidataID)
-		if err != nil {
-			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
-		}
-		for _, entry := range rec.Mappings {
-			if _, _, err := parseFlatMappingEntry(entry); err != nil {
-				return fmt.Errorf("invalid mapping for %s: %q: %w", rec.WikidataID, entry, err)
-			}
-		}
-
-		mJSON := canonicalMappingsJSON(rec.Mappings)
-		eid := strconv.FormatInt(id, 10)
-
-		upsertScript.Run(ctx, pipe,
-			scriptKeys(),
-			mJSON, eid, w.noChangelogFlag(),
-		)
-	}
-
-	cmds, err := pipe.Exec(ctx)
-	if err != nil && err != redis.Nil {
-		// Find the first real error.
-		for _, cmd := range cmds {
-			if cmd.Err() != nil && cmd.Err() != redis.Nil {
-				return fmt.Errorf("upsert batch: %w", cmd.Err())
-			}
-		}
-		return fmt.Errorf("upsert batch: %w", err)
-	}
-	return nil
+	p.pipe = w.rdb.Pipeline()
+	return p
 }
 
-// UpsertRawEntitiesBatchContext atomically inserts or updates multiple
-// entities using canonical mappings JSON already prepared by the caller.
-func (w *Writer) UpsertRawEntitiesBatchContext(ctx context.Context, records []RawEntityRecord) error {
-	if len(records) == 0 {
-		return nil
+// UpsertRawEntity queues an upsert of an entity with pre-encoded mappings JSON.
+func (p *Pipe) UpsertRawEntity(rec RawEntityRecord) {
+	if p.err != nil {
+		return
 	}
-	if err := w.loadScripts(ctx); err != nil {
-		return err
+	id, err := qidToInt(rec.WikidataID)
+	if err != nil {
+		p.err = fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
+		return
 	}
-	pipe := w.rdb.Pipeline()
-
-	for _, rec := range records {
-		id, err := qidToInt(rec.WikidataID)
-		if err != nil {
-			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
-		}
-		if rec.RawMappings == "" {
-			return fmt.Errorf("raw mappings empty for %s", rec.WikidataID)
-		}
-
-		eid := strconv.FormatInt(id, 10)
-		upsertScript.Run(ctx, pipe,
-			scriptKeys(),
-			rec.RawMappings, eid, w.noChangelogFlag(),
-		)
+	if rec.RawMappings == "" {
+		p.err = fmt.Errorf("raw mappings empty for %s", rec.WikidataID)
+		return
 	}
-
-	cmds, err := pipe.Exec(ctx)
-	if err != nil && err != redis.Nil {
-		for _, cmd := range cmds {
-			if cmd.Err() != nil && cmd.Err() != redis.Nil {
-				return fmt.Errorf("upsert batch: %w", cmd.Err())
-			}
-		}
-		return fmt.Errorf("upsert batch: %w", err)
-	}
-	return nil
+	eid := strconv.FormatInt(id, 10)
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), rec.RawMappings, eid, p.w.noChangelogFlag())
 }
 
-// DeleteEntity removes an entity and its mappings.
-func (w *Writer) DeleteEntity(wikidataID string) error {
-	return w.DeleteEntitiesBatchContext(context.Background(), []string{wikidataID})
+// UpsertEntity queues an upsert of an entity, encoding its mappings to
+// canonical JSON.
+func (p *Pipe) UpsertEntity(rec EntityRecord) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(rec.WikidataID)
+	if err != nil {
+		p.err = fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
+		return
+	}
+	for _, entry := range rec.Mappings {
+		if _, _, err := parseFlatMappingEntry(entry); err != nil {
+			p.err = fmt.Errorf("invalid mapping for %s: %q: %w", rec.WikidataID, entry, err)
+			return
+		}
+	}
+	mJSON := canonicalMappingsJSON(rec.Mappings)
+	eid := strconv.FormatInt(id, 10)
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), mJSON, eid, p.w.noChangelogFlag())
 }
 
-// DeleteEntitiesBatch atomically removes multiple entities, their property
-// index entries, and appends delete events to the changelog.
-func (w *Writer) DeleteEntitiesBatch(qids []string) error {
-	return w.DeleteEntitiesBatchContext(context.Background(), qids)
+// DeleteEntity queues a delete of an entity by QID string (e.g. "Q123").
+func (p *Pipe) DeleteEntity(qid string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(qid)
+	if err != nil {
+		p.err = err
+		return
+	}
+	eid := strconv.FormatInt(id, 10)
+	deleteScript.Run(p.ctx, p.pipe, scriptKeys(), eid, p.w.noChangelogFlag())
 }
 
-// DeleteEntitiesBatchContext atomically removes multiple entities, their
-// property index entries, and appends delete events to the changelog using
-// the provided context.
-func (w *Writer) DeleteEntitiesBatchContext(ctx context.Context, qids []string) error {
+// SetSyncState queues an HSET on the meta hash.
+func (p *Pipe) SetSyncState(key, value string) {
+	if p.err != nil {
+		return
+	}
+	p.pipe.HSet(p.ctx, metaKey, key, value)
+}
+
+// DelSyncStates queues an HDEL on the meta hash for the given keys.
+func (p *Pipe) DelSyncStates(keys ...string) {
+	if p.err != nil {
+		return
+	}
+	p.pipe.HDel(p.ctx, metaKey, keys...)
+}
+
+// EnqueueEntities queues an SADD of QIDs into the pending set.
+func (p *Pipe) EnqueueEntities(qids []string) {
+	if p.err != nil {
+		return
+	}
 	if len(qids) == 0 {
-		return nil
+		return
 	}
-	if err := w.loadScripts(ctx); err != nil {
-		return err
-	}
-	pipe := w.rdb.Pipeline()
-
+	members := make([]interface{}, 0, len(qids))
 	for _, qid := range qids {
 		id, err := qidToInt(qid)
 		if err != nil {
-			return err
+			p.err = err
+			return
 		}
-
-		eid := strconv.FormatInt(id, 10)
-		deleteScript.Run(ctx, pipe,
-			scriptKeys(),
-			eid, w.noChangelogFlag(),
-		)
+		members = append(members, strconv.FormatInt(id, 10))
 	}
+	p.pipe.SAdd(p.ctx, pendingKey, members...)
+}
 
-	cmds, err := pipe.Exec(ctx)
+// AckProcessedEntities queues an SREM of QIDs from the processing set.
+func (p *Pipe) AckProcessedEntities(qids []string) {
+	if p.err != nil {
+		return
+	}
+	if len(qids) == 0 {
+		return
+	}
+	members := make([]interface{}, 0, len(qids))
+	for _, qid := range qids {
+		id, err := qidToInt(qid)
+		if err != nil {
+			p.err = err
+			return
+		}
+		members = append(members, strconv.FormatInt(id, 10))
+	}
+	p.pipe.SRem(p.ctx, processingKey, members...)
+}
+
+// RecordFailedEntity queues a Lua script that records a processing failure.
+func (p *Pipe) RecordFailedEntity(wikidataID, errMsg string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(wikidataID)
+	if err != nil {
+		p.err = err
+		return
+	}
+	now := time.Now().UTC()
+	idStr := strconv.FormatInt(id, 10)
+	failKey := fmt.Sprintf("failed:%d", id)
+	recordFailedScript.Run(p.ctx, p.pipe,
+		[]string{failedZsetKey, failKey},
+		idStr, errMsg, now.Format(time.RFC3339), now.UnixMicro(),
+	)
+}
+
+// DeleteFailedEntity queues removal of a failure record (ZREM + DEL).
+func (p *Pipe) DeleteFailedEntity(wikidataID string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(wikidataID)
+	if err != nil {
+		p.err = err
+		return
+	}
+	p.pipe.ZRem(p.ctx, failedZsetKey, strconv.FormatInt(id, 10))
+	p.pipe.Del(p.ctx, fmt.Sprintf("failed:%d", id))
+}
+
+// Exec flushes the pipeline and returns the first error encountered during
+// queueing or execution.
+func (p *Pipe) Exec() error {
+	if p.err != nil {
+		return p.err
+	}
+	cmds, err := p.pipe.Exec(p.ctx)
 	if err != nil && err != redis.Nil {
 		for _, cmd := range cmds {
 			if cmd.Err() != nil && cmd.Err() != redis.Nil {
-				return fmt.Errorf("delete batch: %w", cmd.Err())
+				return cmd.Err()
 			}
 		}
-		return fmt.Errorf("delete batch: %w", err)
+		return err
 	}
 	return nil
 }
 
-// ClearSyncCursors resets the stream resumption state so the next startup
-// triggers a reseed.
-func (w *Writer) ClearSyncCursors() error {
-	ctx := context.Background()
-	pipe := w.rdb.Pipeline()
-	pipe.HDel(ctx, metaKey, "dump_time", "last_event_id")
-	_, err := pipe.Exec(ctx)
-	return err
-}
+// recordFailedScript atomically records a failure: creates or updates the
+// failed:<id> hash and adds the entity to the failed ZSET.
+// KEYS[1] = failedZsetKey, KEYS[2] = failed:<id>
+// ARGV[1] = id (string), ARGV[2] = errMsg, ARGV[3] = now (RFC3339), ARGV[4] = unix timestamp
+var recordFailedScript = redis.NewScript(`
+local exists = redis.call('EXISTS', KEYS[2])
+if exists == 1 then
+  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'last_failed', ARGV[3])
+  redis.call('HINCRBY', KEYS[2], 'attempts', 1)
+else
+  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'attempts', 1, 'first_failed', ARGV[3], 'last_failed', ARGV[3])
+end
+redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1])
+return 1
+`)
 
 // FlushData drops all data and re-initialises the schema version.
 func (w *Writer) FlushData() error {
@@ -373,112 +420,6 @@ func (w *Writer) FlushDataContext(ctx context.Context) error {
 func (w *Writer) TrimChangelog() error {
 	ctx := context.Background()
 	return w.rdb.Del(ctx, changelogKey).Err()
-}
-
-// SetSyncState stores a key-value pair in the meta hash.
-func (w *Writer) SetSyncState(key, value string) error {
-	return w.SetSyncStateContext(context.Background(), key, value)
-}
-
-// SetSyncStateContext stores a key-value pair in the meta hash using the
-// provided context.
-func (w *Writer) SetSyncStateContext(ctx context.Context, key, value string) error {
-	return w.rdb.HSet(ctx, metaKey, key, value).Err()
-}
-
-// GetSyncState retrieves a value from the meta hash. Returns "" if not found.
-func (w *Writer) GetSyncState(key string) (string, error) {
-	val, err := w.rdb.HGet(context.Background(), metaKey, key).Result()
-	if err == redis.Nil {
-		return "", nil
-	}
-	return val, err
-}
-
-// recordFailedScript atomically records a failure: creates or updates the
-// failed:<id> hash and adds the entity to the failed ZSET.
-// KEYS[1] = failedZsetKey, KEYS[2] = failed:<id>
-// ARGV[1] = id (string), ARGV[2] = errMsg, ARGV[3] = now (RFC3339), ARGV[4] = unix timestamp
-var recordFailedScript = redis.NewScript(`
-local exists = redis.call('EXISTS', KEYS[2])
-if exists == 1 then
-  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'last_failed', ARGV[3])
-  redis.call('HINCRBY', KEYS[2], 'attempts', 1)
-else
-  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'attempts', 1, 'first_failed', ARGV[3], 'last_failed', ARGV[3])
-end
-redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1])
-return 1
-`)
-
-// RecordFailedEntity records a processing failure for later retry.
-// If the entity already has a failure record, it increments the attempt count.
-func (w *Writer) RecordFailedEntity(wikidataID, errMsg string) error {
-	id, err := qidToInt(wikidataID)
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	now := time.Now().UTC()
-	idStr := strconv.FormatInt(id, 10)
-	failKey := fmt.Sprintf("failed:%d", id)
-
-	return recordFailedScript.Run(ctx, w.rdb,
-		[]string{failedZsetKey, failKey},
-		idStr, errMsg, now.Format(time.RFC3339), now.UnixMicro(),
-	).Err()
-}
-
-// LastFailedEntities returns up to limit failed entity IDs for retry,
-// oldest first (by first_failed time, which is the ZSET score).
-func (w *Writer) LastFailedEntities(limit int) ([]string, error) {
-	ctx := context.Background()
-	members, err := w.rdb.ZRange(ctx, failedZsetKey, 0, int64(limit-1)).Result()
-	if err != nil {
-		return nil, err
-	}
-	qids := make([]string, 0, len(members))
-	for _, m := range members {
-		id, err := strconv.ParseInt(m, 10, 64)
-		if err != nil {
-			continue
-		}
-		qids = append(qids, intToQid(id))
-	}
-	return qids, nil
-}
-
-// DeleteFailedEntity removes a failure record after successful retry.
-func (w *Writer) DeleteFailedEntity(wikidataID string) error {
-	id, err := qidToInt(wikidataID)
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	pipe := w.rdb.Pipeline()
-	pipe.ZRem(ctx, failedZsetKey, strconv.FormatInt(id, 10))
-	pipe.Del(ctx, fmt.Sprintf("failed:%d", id))
-	_, err = pipe.Exec(ctx)
-	return err
-}
-
-// EnqueueEntities inserts QIDs into the pending set.
-// Duplicates are silently ignored. Returns the number actually inserted.
-func (w *Writer) EnqueueEntities(qids []string) (int, error) {
-	if len(qids) == 0 {
-		return 0, nil
-	}
-	ctx := context.Background()
-	members := make([]interface{}, 0, len(qids))
-	for _, qid := range qids {
-		id, err := qidToInt(qid)
-		if err != nil {
-			return 0, err
-		}
-		members = append(members, strconv.FormatInt(id, 10))
-	}
-	n, err := w.rdb.SAdd(ctx, pendingKey, members...).Result()
-	return int(n), err
 }
 
 // claimScript atomically moves up to ARGV[1] random members from
@@ -512,24 +453,6 @@ func (w *Writer) ClaimPendingBatch(limit int) ([]string, error) {
 	return qids, nil
 }
 
-// AckProcessedEntities removes the given QIDs from the processing set,
-// indicating they have been fully handled.
-func (w *Writer) AckProcessedEntities(qids []string) error {
-	if len(qids) == 0 {
-		return nil
-	}
-	ctx := context.Background()
-	members := make([]interface{}, 0, len(qids))
-	for _, qid := range qids {
-		id, err := qidToInt(qid)
-		if err != nil {
-			return err
-		}
-		members = append(members, strconv.FormatInt(id, 10))
-	}
-	return w.rdb.SRem(ctx, processingKey, members...).Err()
-}
-
 // RecoverProcessing moves any QIDs left in the processing set back to
 // pending. This must be called at startup to recover from a previous crash.
 func (w *Writer) RecoverProcessing() error {
@@ -539,11 +462,6 @@ func (w *Writer) RecoverProcessing() error {
 		return fmt.Errorf("recover processing set: %w", err)
 	}
 	return w.rdb.Del(ctx, processingKey).Err()
-}
-
-// PendingCount returns the number of entities in the pending set.
-func (w *Writer) PendingCount() (int64, error) {
-	return w.rdb.SCard(context.Background(), pendingKey).Result()
 }
 
 // Close is a no-op for Writer; the underlying Client manages the connection.

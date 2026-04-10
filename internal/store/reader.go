@@ -54,6 +54,55 @@ func (r *Reader) LookupByProperty(property int, value string) (*model.LookupResu
 	return r.LookupByPropertyContext(context.Background(), property, value)
 }
 
+// GetSyncState retrieves a value from the meta hash. Returns "" if not found.
+func (r *Reader) GetSyncState(key string) (string, error) {
+	val, err := r.rdb.HGet(context.Background(), metaKey, key).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return val, err
+}
+
+// GetSyncStates retrieves multiple values from the meta hash in a single
+// round-trip. Missing keys are returned as empty strings.
+func (r *Reader) GetSyncStates(keys ...string) (map[string]string, error) {
+	vals, err := r.rdb.HMGet(context.Background(), metaKey, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(keys))
+	for i, key := range keys {
+		if i < len(vals) && vals[i] != nil {
+			result[key] = vals[i].(string)
+		}
+	}
+	return result, nil
+}
+
+// PendingCount returns the number of entities in the pending set.
+func (r *Reader) PendingCount() (int64, error) {
+	return r.rdb.SCard(context.Background(), pendingKey).Result()
+}
+
+// LastFailedEntities returns up to limit failed entity IDs for retry,
+// oldest first (by first_failed time, which is the ZSET score).
+func (r *Reader) LastFailedEntities(limit int) ([]string, error) {
+	ctx := context.Background()
+	members, err := r.rdb.ZRange(ctx, failedZsetKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+	qids := make([]string, 0, len(members))
+	for _, m := range members {
+		id, err := strconv.ParseInt(m, 10, 64)
+		if err != nil {
+			continue
+		}
+		qids = append(qids, intToQid(id))
+	}
+	return qids, nil
+}
+
 // LookupByPropertyContext finds the entity mapped to (property, value) and
 // returns all of that entity's mappings in a single round-trip via Lua.
 func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, value string) (*model.LookupResult, error) {

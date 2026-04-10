@@ -289,6 +289,7 @@ func (s *Seeder) findDatedDumpURL(ctx context.Context) (url, dateStr string, sta
 // Seeder handles bulk import by streaming a Wikidata JSON dump.
 type Seeder struct {
 	writer      *store.Writer
+	reader      *store.Reader
 	httpClient  *http.Client
 	dumpFormat  DumpFormat
 	dumpLocator func(ctx context.Context) (url, dateStr string, stale bool)
@@ -297,7 +298,7 @@ type Seeder struct {
 // NewSeeder creates a new Seeder. The format parameter selects the
 // compression format (DumpFormatGZ or DumpFormatBZ2). An empty value
 // defaults to gz.
-func NewSeeder(writer *store.Writer, httpClient *http.Client, format DumpFormat) *Seeder {
+func NewSeeder(writer *store.Writer, reader *store.Reader, httpClient *http.Client, format DumpFormat) *Seeder {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 0}
 	}
@@ -306,6 +307,7 @@ func NewSeeder(writer *store.Writer, httpClient *http.Client, format DumpFormat)
 	}
 	seeder := &Seeder{
 		writer:     writer,
+		reader:     reader,
 		httpClient: httpClient,
 		dumpFormat: format,
 	}
@@ -328,7 +330,7 @@ func (s *Seeder) newDecompressor(r io.Reader) (io.Reader, error) {
 
 // NeedsSeed determines whether the database needs seeding.
 func (s *Seeder) NeedsSeed() (bool, error) {
-	dumpTime, err := s.writer.GetSyncState("dump_time")
+	dumpTime, err := s.reader.GetSyncState("dump_time")
 	if err != nil {
 		return false, err
 	}
@@ -336,7 +338,7 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 		return true, nil
 	}
 
-	storedHash, err := s.writer.GetSyncState("config_hash")
+	storedHash, err := s.reader.GetSyncState("config_hash")
 	if err != nil {
 		return false, err
 	}
@@ -382,11 +384,11 @@ func (s *Seeder) Seed(ctx context.Context) error {
 		return fmt.Errorf("flush data: %w", err)
 	}
 
-	if err := s.writer.SetSyncStateContext(ctx, "config_hash", configFingerprint()); err != nil {
-		return fmt.Errorf("set config hash: %w", err)
-	}
-	if err := s.writer.SetSyncStateContext(ctx, "state", "seeding"); err != nil {
-		return fmt.Errorf("set state: %w", err)
+	p := s.writer.NewPipe(ctx)
+	p.SetSyncState("config_hash", configFingerprint())
+	p.SetSyncState("state", "seeding")
+	if err := p.Exec(); err != nil {
+		return fmt.Errorf("set seed state: %w", err)
 	}
 
 	// Convert YYYYMMDD to RFC3339
@@ -457,7 +459,9 @@ func (s *Seeder) Seed(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.writer.SetSyncStateContext(ctx, "dump_time", syncTime); err != nil {
+	p = s.writer.NewPipe(ctx)
+	p.SetSyncState("dump_time", syncTime)
+	if err := p.Exec(); err != nil {
 		return fmt.Errorf("set dump_time: %w", err)
 	}
 
@@ -535,7 +539,11 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 						return err
 					}
 				}
-				err = s.writer.UpsertEntitiesBatchContext(writeCtx, batch)
+				p := s.writer.NewPipe(writeCtx)
+				for _, rec := range batch {
+					p.UpsertEntity(rec)
+				}
+				err = p.Exec()
 				if err == nil {
 					batch = batch[:0]
 					return nil

@@ -39,6 +39,38 @@ func testSetup(t *testing.T) (*store.Writer, *store.Reader, *redis.Client, *mini
 	return w, r, c.Redis(), s
 }
 
+// testUpsertEntity is a test helper that wraps Pipe for convenience.
+func testUpsertEntity(t *testing.T, w *store.Writer, wikidataID string, mappings []string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.UpsertEntity(store.EntityRecord{WikidataID: wikidataID, Mappings: mappings})
+	if err := p.Exec(); err != nil {
+		t.Fatalf("UpsertEntity(%s): %v", wikidataID, err)
+	}
+}
+
+// testSetSyncState is a test helper that wraps Pipe for convenience.
+func testSetSyncState(t *testing.T, w *store.Writer, key, value string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.SetSyncState(key, value)
+	if err := p.Exec(); err != nil {
+		t.Fatalf("SetSyncState(%s): %v", key, err)
+	}
+}
+
+// testUpsertRawEntitiesBatch is a test helper that wraps Pipe for convenience.
+func testUpsertRawEntitiesBatch(t *testing.T, w *store.Writer, ctx context.Context, records []store.RawEntityRecord) {
+	t.Helper()
+	p := w.NewPipe(ctx)
+	for _, rec := range records {
+		p.UpsertRawEntity(rec)
+	}
+	if err := p.Exec(); err != nil {
+		t.Fatalf("UpsertRawEntitiesBatch: %v", err)
+	}
+}
+
 // --- compareStreamIDs ---
 
 func TestCompareStreamIDs(t *testing.T) {
@@ -266,15 +298,9 @@ func TestSnapshotGeneration(t *testing.T) {
 	w, reader, _, _ := testSetup(t)
 
 	// Insert entities via the writer so they appear in the changelog.
-	if err := w.UpsertEntity("Q42", []string{"P345:tt0111161"}); err != nil {
-		t.Fatalf("UpsertEntity: %v", err)
-	}
-	if err := w.UpsertEntity("Q43", []string{"P345:tt0111162"}); err != nil {
-		t.Fatalf("UpsertEntity: %v", err)
-	}
-	if err := w.SetSyncState("state", "streaming"); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testUpsertEntity(t, w, "Q42", []string{"P345:tt0111161"})
+	testUpsertEntity(t, w, "Q43", []string{"P345:tt0111162"})
+	testSetSyncState(t, w, "state", "streaming")
 
 	dir := t.TempDir()
 	gen := NewSnapshotGenerator(reader, dir, time.Hour)
@@ -385,9 +411,7 @@ func TestSnapshotGenerationSkipsEmptyChangelog(t *testing.T) {
 	w, reader, _, _ := testSetup(t)
 
 	// Set state to "streaming" without adding any changelog entries.
-	if err := w.SetSyncState("state", "streaming"); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testSetSyncState(t, w, "state", "streaming")
 
 	dir := t.TempDir()
 	gen := NewSnapshotGenerator(reader, dir, time.Hour)
@@ -408,12 +432,8 @@ func TestSnapshotGenerationInvalidatesStaleSnapshot(t *testing.T) {
 	ctx := context.Background()
 
 	// Create initial entities and a snapshot.
-	if err := w.UpsertEntity("Q1", []string{"P345:tt0000001"}); err != nil {
-		t.Fatalf("UpsertEntity: %v", err)
-	}
-	if err := w.SetSyncState("state", "streaming"); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001"})
+	testSetSyncState(t, w, "state", "streaming")
 
 	dir := t.TempDir()
 	gen := NewSnapshotGenerator(reader, dir, time.Hour)
@@ -432,12 +452,8 @@ func TestSnapshotGenerationInvalidatesStaleSnapshot(t *testing.T) {
 	if err := w.FlushDataContext(ctx); err != nil {
 		t.Fatalf("FlushDataContext: %v", err)
 	}
-	if err := w.UpsertEntity("Q2", []string{"P345:tt0000002"}); err != nil {
-		t.Fatalf("UpsertEntity after reseed: %v", err)
-	}
-	if err := w.SetSyncState("state", "streaming"); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt0000002"})
+	testSetSyncState(t, w, "state", "streaming")
 
 	// ServeSnapshot should detect the stale snapshot and return 503,
 	// signalling the Run loop to regenerate.
@@ -480,9 +496,7 @@ func TestSnapshotCheckpointOffsetsStartFrames(t *testing.T) {
 	w, reader, _, _ := testSetup(t)
 	ctx := context.Background()
 
-	if err := w.SetSyncState("state", "streaming"); err != nil {
-		t.Fatalf("SetSyncState: %v", err)
-	}
+	testSetSyncState(t, w, "state", "streaming")
 
 	for start := 1; start <= SnapshotFrameSize+1; start += 1000 {
 		end := min(start+999, SnapshotFrameSize+1)
@@ -493,9 +507,7 @@ func TestSnapshotCheckpointOffsetsStartFrames(t *testing.T) {
 				RawMappings: fmt.Sprintf(`["P345:tt%07d"]`, qid),
 			})
 		}
-		if err := w.UpsertRawEntitiesBatchContext(ctx, records); err != nil {
-			t.Fatalf("UpsertRawEntitiesBatchContext(%d-%d): %v", start, end, err)
-		}
+		testUpsertRawEntitiesBatch(t, w, ctx, records)
 	}
 
 	dir := t.TempDir()

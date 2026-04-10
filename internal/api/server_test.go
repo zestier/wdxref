@@ -64,19 +64,22 @@ func TestLookupSuccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp lookupResponse
+	var resp []lookupResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 
-	if resp.WikidataID != "Q172241" {
-		t.Errorf("WikidataID = %q, want %q", resp.WikidataID, "Q172241")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp))
 	}
-	if !slices.Contains(resp.Mappings, "P345:tt0111161") {
-		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp.Mappings)
+	if resp[0].WikidataID != "Q172241" {
+		t.Errorf("WikidataID = %q, want %q", resp[0].WikidataID, "Q172241")
 	}
-	if !slices.Contains(resp.Mappings, "P4947:278") {
-		t.Errorf("expected P4947:278 in mappings, got %v", resp.Mappings)
+	if !slices.Contains(resp[0].Mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp[0].Mappings)
+	}
+	if !slices.Contains(resp[0].Mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", resp[0].Mappings)
 	}
 
 	cc := rec.Header().Get("Cache-Control")
@@ -97,16 +100,16 @@ func TestLookupNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	var resp errorResponse
+	var resp []lookupResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Error != "not_found" {
-		t.Errorf("Error = %q, want %q", resp.Error, "not_found")
+	if len(resp) != 0 {
+		t.Errorf("expected empty array, got %+v", resp)
 	}
 }
 
@@ -218,10 +221,10 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4947 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var movieResp lookupResponse
+	var movieResp []lookupResponse
 	json.NewDecoder(rec.Body).Decode(&movieResp)
-	if movieResp.WikidataID != "Q172241" {
-		t.Errorf("P4947 WikidataID = %q, want Q172241", movieResp.WikidataID)
+	if len(movieResp) != 1 || movieResp[0].WikidataID != "Q172241" {
+		t.Errorf("P4947 WikidataID = %+v, want Q172241", movieResp)
 	}
 
 	req = httptest.NewRequest("GET", "/v1/lookup/P4983/278", nil)
@@ -231,10 +234,48 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4983 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var tvResp lookupResponse
+	var tvResp []lookupResponse
 	json.NewDecoder(rec.Body).Decode(&tvResp)
-	if tvResp.WikidataID != "Q999999" {
-		t.Errorf("P4983 WikidataID = %q, want Q999999", tvResp.WikidataID)
+	if len(tvResp) != 1 || tvResp[0].WikidataID != "Q999999" {
+		t.Errorf("P4983 WikidataID = %+v, want Q999999", tvResp)
+	}
+}
+
+func TestLookupSharedExternalID(t *testing.T) {
+	srv, w := setupTestServer(t)
+
+	// Two entities claim the same IMDb ID.
+	testUpsertEntity(t, w, "Q100", []string{"P345:tt1234567", "P4947:100"})
+	testUpsertEntity(t, w, "Q200", []string{"P345:tt1234567", "P4947:200"})
+
+	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt1234567", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp []lookupResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp) != 2 {
+		t.Fatalf("expected 2 results, got %d: %+v", len(resp), resp)
+	}
+
+	// Results should be sorted lexicographically by entity ID.
+	ids := []string{resp[0].WikidataID, resp[1].WikidataID}
+	if ids[0] != "Q100" || ids[1] != "Q200" {
+		t.Errorf("wikidata_ids = %v, want [Q100, Q200]", ids)
+	}
+
+	// Each result should carry its own mappings.
+	if !slices.Contains(resp[0].Mappings, "P4947:100") {
+		t.Errorf("Q100 mappings = %v, want P4947:100", resp[0].Mappings)
+	}
+	if !slices.Contains(resp[1].Mappings, "P4947:200") {
+		t.Errorf("Q200 mappings = %v, want P4947:200", resp[1].Mappings)
 	}
 }
 

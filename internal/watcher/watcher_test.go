@@ -329,10 +329,7 @@ func TestProcessorWithMockServer(t *testing.T) {
 		t.Fatalf("ProcessEntity: %v", err)
 	}
 
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected result after processing, got nil")
 	}
@@ -441,10 +438,7 @@ func TestProcessEntities_BatchWithMixedResults(t *testing.T) {
 		t.Errorf("Q999 should succeed (delete), got: %v", perErrors["Q999"])
 	}
 
-	result, err := reader.LookupByProperty(345, "tt1234567")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt1234567")
 	if result == nil {
 		t.Fatal("Q1 should be stored")
 	}
@@ -484,10 +478,7 @@ func TestProcessEntities_AbsentFromResponseIsError(t *testing.T) {
 	}
 
 	// Verify Q50 was NOT deleted.
-	result, err := reader.LookupByProperty(345, "tt9999999")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt9999999")
 	if result == nil {
 		t.Fatal("Q50 should NOT have been deleted")
 	}

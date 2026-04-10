@@ -87,19 +87,16 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if result == nil {
-		writeError(w, http.StatusNotFound, "not_found",
-			fmt.Sprintf("No mapping found for %s:%s", strings.ToUpper(key[:1])+key[1:], value))
-		return
+	resp := make([]lookupResponse, len(result))
+	for i, r := range result {
+		resp[i] = lookupResponse{
+			WikidataID: fmt.Sprintf("Q%d", r.WikidataID),
+			Mappings:   r.Mappings,
+		}
 	}
 
-	wikidataIDStr := fmt.Sprintf("Q%d", result.WikidataID)
-
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	writeJSON(w, http.StatusOK, lookupResponse{
-		WikidataID: wikidataIDStr,
-		Mappings:   result.Mappings,
-	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleWikidataLookup(w http.ResponseWriter, r *http.Request) {

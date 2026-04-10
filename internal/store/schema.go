@@ -6,7 +6,7 @@ import "errors"
 // the key structure, encoding format, or data model changes. On startup the
 // Writer issues FLUSHDB when the stored version does not match, and the
 // Reader reports a degraded state so the API can return 503.
-const schemaVersion = "v11-entities-hash"
+const schemaVersion = "v12-many-to-many-props"
 
 // ErrSchemaMismatch is returned by Reader methods when the database was
 // created with a different schema version. The API server should map this

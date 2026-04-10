@@ -61,15 +61,39 @@ local function parse(e)
   return 'p:' .. string.sub(e, 2, colon - 1), string.sub(e, colon + 1)
 end
 
+-- Insert eid into a comma-separated sorted list stored at hash key pk, field val.
 local function add_idx(e)
   local pk, val = parse(e)
-  redis.call('HSET', pk, val, eid)
+  local cur = redis.call('HGET', pk, val)
+  if not cur then
+    redis.call('HSET', pk, val, eid)
+    return
+  end
+  local parts = {}
+  local found = false
+  for s in string.gmatch(cur, '[^,]+') do
+    if s == eid then found = true end
+    parts[#parts + 1] = s
+  end
+  if found then return end
+  parts[#parts + 1] = eid
+  table.sort(parts)
+  redis.call('HSET', pk, val, table.concat(parts, ','))
 end
 
+-- Remove eid from a comma-separated sorted list stored at hash key pk, field val.
 local function del_idx(e)
   local pk, val = parse(e)
-  if redis.call('HGET', pk, val) == eid then
+  local cur = redis.call('HGET', pk, val)
+  if not cur then return end
+  local parts = {}
+  for s in string.gmatch(cur, '[^,]+') do
+    if s ~= eid then parts[#parts + 1] = s end
+  end
+  if #parts == 0 then
     redis.call('HDEL', pk, val)
+  else
+    redis.call('HSET', pk, val, table.concat(parts, ','))
   end
 end
 
@@ -125,9 +149,18 @@ for _, entry in ipairs(old) do
   local colon = string.find(entry, ':', 2)
   local prop = string.sub(entry, 2, colon - 1)
   local val  = string.sub(entry, colon + 1)
-  local cur = redis.call('HGET', 'p:' .. prop, val)
-  if cur == eid then
-    redis.call('HDEL', 'p:' .. prop, val)
+  local pk = 'p:' .. prop
+  local cur = redis.call('HGET', pk, val)
+  if cur then
+    local parts = {}
+    for s in string.gmatch(cur, '[^,]+') do
+      if s ~= eid then parts[#parts + 1] = s end
+    end
+    if #parts == 0 then
+      redis.call('HDEL', pk, val)
+    else
+      redis.call('HSET', pk, val, table.concat(parts, ','))
+    end
   end
 end
 

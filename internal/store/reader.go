@@ -12,15 +12,24 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// lookupByPropertyScript resolves (property, value) → entity in a single
+// lookupByPropertyScript resolves (property, value) → entities in a single
 // round-trip.  KEYS[1] = property hash key.  ARGV[1] = value.
-// Returns {qid, mappings_json} or nil when not found.
+// Returns a flat array of {qid, mappings_json, qid, mappings_json, ...}
+// pairs for all entities in the index, or nil when not found.
+// Entities with empty mappings are skipped.
 var lookupByPropertyScript = redis.NewScript(`
-local qid = redis.call('HGET', KEYS[1], ARGV[1])
-if not qid then return nil end
-local m = redis.call('HGET', 'entities', qid)
-if not m then return nil end
-return {qid, m}
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return nil end
+local result = {}
+for eid in string.gmatch(raw, '[^,]+') do
+  local m = redis.call('HGET', 'entities', eid)
+  if m then
+    result[#result + 1] = eid
+    result[#result + 1] = m
+  end
+end
+if #result == 0 then return nil end
+return result
 `)
 
 // Reader provides read-only access to Kvrocks (used by the API server and replicator).
@@ -48,9 +57,10 @@ func NewReaderFromWriter(w *Writer) *Reader {
 	return &Reader{rdb: w.rdb, schemaOK: schemaOK}
 }
 
-// LookupByProperty finds the entity mapped to (property, value) and returns
-// all of that entity's mappings in a single round-trip via Lua.
-func (r *Reader) LookupByProperty(property int, value string) (*model.LookupResult, error) {
+// LookupByProperty finds all entities mapped to (property, value) and returns
+// each entity's mappings in a single round-trip via Lua.
+// Returns an empty slice when no mappings are found.
+func (r *Reader) LookupByProperty(property int, value string) ([]model.LookupResult, error) {
 	return r.LookupByPropertyContext(context.Background(), property, value)
 }
 
@@ -103,9 +113,10 @@ func (r *Reader) LastFailedEntities(limit int) ([]string, error) {
 	return qids, nil
 }
 
-// LookupByPropertyContext finds the entity mapped to (property, value) and
-// returns all of that entity's mappings in a single round-trip via Lua.
-func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, value string) (*model.LookupResult, error) {
+// LookupByPropertyContext finds all entities mapped to (property, value) and
+// returns each entity's mappings in a single round-trip via Lua.
+// Returns an empty slice when no mappings are found.
+func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, value string) ([]model.LookupResult, error) {
 	if !r.schemaOK {
 		return nil, ErrSchemaMismatch
 	}
@@ -113,33 +124,38 @@ func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, valu
 	res, err := lookupByPropertyScript.Run(ctx, r.rdb,
 		[]string{propKey(property)}, value).StringSlice()
 	if err == redis.Nil {
-		return nil, nil
+		return []model.LookupResult{}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup by property: %w", err)
 	}
-	if len(res) != 2 {
-		return nil, nil
+	if len(res) < 2 {
+		return []model.LookupResult{}, nil
 	}
 
-	qid, err := strconv.ParseInt(res[0], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("parse QID from script: %w", err)
+	results := make([]model.LookupResult, 0, len(res)/2)
+	for i := 0; i+1 < len(res); i += 2 {
+		qid, err := strconv.ParseInt(res[i], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse QID from script: %w", err)
+		}
+
+		var mappings []string
+		if err := json.Unmarshal([]byte(res[i+1]), &mappings); err != nil {
+			return nil, fmt.Errorf("unmarshal entity: %w", err)
+		}
+
+		if len(mappings) == 0 {
+			continue
+		}
+
+		results = append(results, model.LookupResult{
+			WikidataID: qid,
+			Mappings:   mappings,
+		})
 	}
 
-	var mappings []string
-	if err := json.Unmarshal([]byte(res[1]), &mappings); err != nil {
-		return nil, fmt.Errorf("unmarshal entity: %w", err)
-	}
-
-	if len(mappings) == 0 {
-		return nil, nil
-	}
-
-	return &model.LookupResult{
-		WikidataID: qid,
-		Mappings:   mappings,
-	}, nil
+	return results, nil
 }
 
 // LookupByWikidataID finds the entity by its Wikidata numeric ID and returns

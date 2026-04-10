@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/ekeid/ekeid/internal/model"
 )
 
 func newTestSetup(t *testing.T) (*Writer, *Reader) {
@@ -119,6 +120,21 @@ func testClearSyncCursors(t *testing.T, w *Writer) error {
 	return p.Exec()
 }
 
+// testLookupFirst is a convenience helper that calls LookupByProperty and
+// returns the first result using the old single-result semantics.
+// Returns nil when the result slice is empty.
+func testLookupFirst(t *testing.T, r *Reader, property int, value string) *model.LookupResult {
+	t.Helper()
+	results, err := r.LookupByProperty(property, value)
+	if err != nil {
+		t.Fatalf("LookupByProperty(%d, %q): %v", property, value, err)
+	}
+	if len(results) == 0 {
+		return nil
+	}
+	return &results[0]
+}
+
 func TestWriterCreatesSchema(t *testing.T) {
 	_, r := newTestSetup(t)
 
@@ -141,10 +157,7 @@ func TestUpsertAndLookup(t *testing.T) {
 	}
 
 	// Lookup by IMDb property
-	result, err := r.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected result, got nil")
 	}
@@ -159,10 +172,7 @@ func TestUpsertAndLookup(t *testing.T) {
 	}
 
 	// Lookup by TMDB movie property
-	result2, err := r.LookupByProperty(4947, "278")
-	if err != nil {
-		t.Fatalf("LookupByProperty tmdb: %v", err)
-	}
+	result2 := testLookupFirst(t, r, 4947, "278")
 	if result2 == nil {
 		t.Fatal("expected result for tmdb lookup, got nil")
 	}
@@ -174,10 +184,7 @@ func TestUpsertAndLookup(t *testing.T) {
 func TestLookupNotFound(t *testing.T) {
 	_, r := newTestSetup(t)
 
-	result, err := r.LookupByProperty(345, "tt9999999")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt9999999")
 	if result != nil {
 		t.Errorf("expected nil result, got %+v", result)
 	}
@@ -213,10 +220,7 @@ func TestUpsertUpdatesEntity(t *testing.T) {
 		t.Fatalf("UpsertEntity (update): %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt0903747")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt0903747")
 	if len(result.Mappings) != 4 {
 		t.Errorf("len(Mappings) = %d, want 4", len(result.Mappings))
 	}
@@ -240,10 +244,7 @@ func TestUpsertRemovesOldIDs(t *testing.T) {
 		t.Fatalf("UpsertEntity (update): %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt0903747")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt0903747")
 	if len(result.Mappings) != 2 {
 		t.Errorf("len(Mappings) = %d, want 2 (tvmaze should be removed)", len(result.Mappings))
 	}
@@ -252,10 +253,7 @@ func TestUpsertRemovesOldIDs(t *testing.T) {
 	}
 
 	// Old property index key should also be gone.
-	result2, err := r.LookupByProperty(2638, "169")
-	if err != nil {
-		t.Fatalf("LookupByProperty old: %v", err)
-	}
+	result2 := testLookupFirst(t, r, 2638, "169")
 	if result2 != nil {
 		t.Error("old property index should be deleted")
 	}
@@ -308,10 +306,7 @@ func TestDeleteEntity(t *testing.T) {
 		t.Fatalf("DeleteEntity: %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt0111161")
 	if result != nil {
 		t.Errorf("expected nil after delete, got %+v", result)
 	}
@@ -325,10 +320,7 @@ func TestDeleteEntityCascadesMappings(t *testing.T) {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty before delete: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result == nil || len(result.Mappings) != 3 {
 		t.Fatalf("expected 3 mappings before delete, got %+v", result)
 	}
@@ -338,10 +330,7 @@ func TestDeleteEntityCascadesMappings(t *testing.T) {
 		t.Fatalf("DeleteEntity: %v", err)
 	}
 
-	result, err = r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty after delete: %v", err)
-	}
+	result = testLookupFirst(t, r, 345, "tt1")
 	if result != nil {
 		t.Errorf("expected mapping to be deleted")
 	}
@@ -368,19 +357,13 @@ func TestDeleteEntitiesBatchCascade(t *testing.T) {
 	}
 
 	for _, val := range []string{"tt1", "tt3"} {
-		result, err := r.LookupByProperty(345, val)
-		if err != nil {
-			t.Fatalf("LookupByProperty %s: %v", val, err)
-		}
+		result := testLookupFirst(t, r, 345, val)
 		if result != nil {
 			t.Errorf("expected %s to be deleted", val)
 		}
 	}
 
-	result, err := r.LookupByProperty(345, "tt2")
-	if err != nil {
-		t.Fatalf("LookupByProperty tt2: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt2")
 	if result == nil || result.WikidataID != 2 {
 		t.Errorf("expected Q2 to survive, got %+v", result)
 	}
@@ -431,10 +414,7 @@ func TestMigrateSchemaMatchingVersion(t *testing.T) {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result == nil {
 		t.Error("expected data to survive no-op MigrateSchema")
 	}
@@ -456,10 +436,7 @@ func TestMigrateSchemaDropsOnMismatch(t *testing.T) {
 
 	// Data should be gone (FLUSHDB).
 	r := &Reader{rdb: w.rdb, schemaOK: true}
-	result, err := r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result != nil {
 		t.Error("expected data to be dropped after schema mismatch")
 	}
@@ -617,7 +594,7 @@ func TestMigrateSchemaIdempotent(t *testing.T) {
 		t.Fatalf("third MigrateSchema: %v", err)
 	}
 
-	result, _ := r.LookupByProperty(345, "tt1")
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result == nil {
 		t.Error("data should survive idempotent MigrateSchema calls")
 	}
@@ -732,33 +709,148 @@ func TestUpsertConflictingExternalID(t *testing.T) {
 		t.Fatalf("UpsertEntity Q100: %v", err)
 	}
 
-	// Q200 claims the same IMDb ID — latest write wins the p: index.
+	// Q200 claims the same IMDb ID — both are stored in the index.
 	err = testUpsertEntity(t, w, "Q200", []string{"P345:tt1234567", "P4947:200"})
 	if err != nil {
 		t.Fatalf("UpsertEntity Q200 should succeed but got: %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt1234567")
+	// Lookup returns both entities, sorted lexicographically by entity ID.
+	results, err := r.LookupByProperty(345, "tt1234567")
 	if err != nil {
 		t.Fatalf("LookupByProperty: %v", err)
 	}
-	if result == nil {
-		t.Fatal("expected result, got nil")
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	if result.WikidataID != 200 {
-		t.Errorf("WikidataID = %d, want 200 (latest upsert should win)", result.WikidataID)
+	if results[0].WikidataID != 100 {
+		t.Errorf("results[0].WikidataID = %d, want 100", results[0].WikidataID)
+	}
+	if results[1].WikidataID != 200 {
+		t.Errorf("results[1].WikidataID = %d, want 200", results[1].WikidataID)
 	}
 
-	// Q100 is still reachable via its unique TMDB ID.
-	result2, err := r.LookupByProperty(4947, "100")
-	if err != nil {
-		t.Fatalf("LookupByProperty Q100 tmdb: %v", err)
-	}
+	// Both entities are still reachable via their unique TMDB IDs.
+	result2 := testLookupFirst(t, r, 4947, "100")
 	if result2 == nil {
 		t.Fatal("Q100 should still exist via TMDB ID")
 	}
 	if result2.WikidataID != 100 {
 		t.Errorf("WikidataID = %d, want 100", result2.WikidataID)
+	}
+
+	// Removing Q100's claim on the shared IMDb ID should leave only Q200.
+	err = testUpsertEntity(t, w, "Q100", []string{"P4947:100"})
+	if err != nil {
+		t.Fatalf("UpsertEntity Q100 update: %v", err)
+	}
+
+	results, err = r.LookupByProperty(345, "tt1234567")
+	if err != nil {
+		t.Fatalf("LookupByProperty after Q100 update: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result after Q100 update, got %d", len(results))
+	}
+	if results[0].WikidataID != 200 {
+		t.Errorf("WikidataID = %d, want 200 (Q100 no longer claims this ID)", results[0].WikidataID)
+	}
+}
+
+func TestDeleteSharedExternalID(t *testing.T) {
+	w, r := newTestSetup(t)
+
+	// Two entities share the same IMDb ID.
+	testUpsertEntity(t, w, "Q100", []string{"P345:tt1234567", "P4947:100"})
+	testUpsertEntity(t, w, "Q200", []string{"P345:tt1234567", "P4947:200"})
+
+	results, err := r.LookupByProperty(345, "tt1234567")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results before delete, got %d", len(results))
+	}
+
+	// Delete Q100 — Q200 must remain reachable via the shared ID.
+	if err := testDeleteEntity(t, w, "Q100"); err != nil {
+		t.Fatalf("DeleteEntity Q100: %v", err)
+	}
+
+	results, err = r.LookupByProperty(345, "tt1234567")
+	if err != nil {
+		t.Fatalf("LookupByProperty after delete: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result after delete, got %d", len(results))
+	}
+	if results[0].WikidataID != 200 {
+		t.Errorf("WikidataID = %d, want 200", results[0].WikidataID)
+	}
+
+	// Q100's unique TMDB ID should also be gone.
+	result := testLookupFirst(t, r, 4947, "100")
+	if result != nil {
+		t.Errorf("expected Q100 TMDB index to be deleted, got %+v", result)
+	}
+
+	// Delete Q200 — shared ID index should now be empty.
+	if err := testDeleteEntity(t, w, "Q200"); err != nil {
+		t.Fatalf("DeleteEntity Q200: %v", err)
+	}
+
+	results, err = r.LookupByProperty(345, "tt1234567")
+	if err != nil {
+		t.Fatalf("LookupByProperty after both deleted: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 results after both deleted, got %d", len(results))
+	}
+}
+
+func TestThreeWaySharedExternalID(t *testing.T) {
+	w, r := newTestSetup(t)
+
+	testUpsertEntity(t, w, "Q10", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q20", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q30", []string{"P345:tt1"})
+
+	results, err := r.LookupByProperty(345, "tt1")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+
+	// Remove the middle entity.
+	if err := testDeleteEntity(t, w, "Q20"); err != nil {
+		t.Fatalf("DeleteEntity Q20: %v", err)
+	}
+
+	results, err = r.LookupByProperty(345, "tt1")
+	if err != nil {
+		t.Fatalf("LookupByProperty after delete: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results after delete, got %d", len(results))
+	}
+	if results[0].WikidataID != 10 || results[1].WikidataID != 30 {
+		t.Errorf("results = [%d, %d], want [10, 30]", results[0].WikidataID, results[1].WikidataID)
+	}
+
+	// Update Q10 to drop its claim — only Q30 remains.
+	testUpsertEntity(t, w, "Q10", []string{"P4947:999"})
+
+	results, err = r.LookupByProperty(345, "tt1")
+	if err != nil {
+		t.Fatalf("LookupByProperty after Q10 update: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].WikidataID != 30 {
+		t.Errorf("WikidataID = %d, want 30", results[0].WikidataID)
 	}
 }
 
@@ -777,18 +869,12 @@ func TestPropertyDisambiguation(t *testing.T) {
 		t.Fatalf("UpsertEntity tv: %v", err)
 	}
 
-	movieResult, err := r.LookupByProperty(4947, "278")
-	if err != nil {
-		t.Fatalf("LookupByProperty movie: %v", err)
-	}
+	movieResult := testLookupFirst(t, r, 4947, "278")
 	if movieResult.WikidataID != 172241 {
 		t.Errorf("movie WikidataID = %d, want 172241", movieResult.WikidataID)
 	}
 
-	tvResult, err := r.LookupByProperty(4983, "278")
-	if err != nil {
-		t.Fatalf("LookupByProperty tv: %v", err)
-	}
+	tvResult := testLookupFirst(t, r, 4983, "278")
 	if tvResult.WikidataID != 999999 {
 		t.Errorf("tv WikidataID = %d, want 999999", tvResult.WikidataID)
 	}
@@ -810,10 +896,7 @@ func TestUpsertEntitiesBatch(t *testing.T) {
 		t.Fatalf("UpsertEntitiesBatch: %v", err)
 	}
 
-	movie, err := r.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty movie: %v", err)
-	}
+	movie := testLookupFirst(t, r, 345, "tt0111161")
 	if movie == nil || movie.WikidataID != 172241 {
 		t.Errorf("expected 172241, got %+v", movie)
 	}
@@ -821,18 +904,12 @@ func TestUpsertEntitiesBatch(t *testing.T) {
 		t.Errorf("expected P4947:278 in mappings, got %v", movie.Mappings)
 	}
 
-	tv, err := r.LookupByProperty(345, "tt0903747")
-	if err != nil {
-		t.Fatalf("LookupByProperty tv: %v", err)
-	}
+	tv := testLookupFirst(t, r, 345, "tt0903747")
 	if tv == nil || tv.WikidataID != 1079 {
 		t.Errorf("expected 1079, got %+v", tv)
 	}
 
-	game, err := r.LookupByProperty(1733, "620")
-	if err != nil {
-		t.Fatalf("LookupByProperty game: %v", err)
-	}
+	game := testLookupFirst(t, r, 1733, "620")
 	if game == nil || game.WikidataID != 47740 {
 		t.Errorf("expected 47740, got %+v", game)
 	}
@@ -863,10 +940,7 @@ func TestUpsertEntitiesBatchUpdatesExisting(t *testing.T) {
 		t.Fatalf("UpsertEntitiesBatch: %v", err)
 	}
 
-	result, err := r.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt0111161")
 	if len(result.Mappings) != 2 {
 		t.Errorf("Mappings = %d, want 2", len(result.Mappings))
 	}
@@ -881,18 +955,12 @@ func TestMultiValuedProperty(t *testing.T) {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
 
-	result1, err := r.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result1 := testLookupFirst(t, r, 345, "tt0111161")
 	if result1 == nil || result1.WikidataID != 172241 {
 		t.Errorf("expected 172241 for first IMDb, got %+v", result1)
 	}
 
-	result2, err := r.LookupByProperty(345, "tt9999999")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result2 := testLookupFirst(t, r, 345, "tt9999999")
 	if result2 == nil || result2.WikidataID != 172241 {
 		t.Errorf("expected 172241 for second IMDb, got %+v", result2)
 	}
@@ -1269,10 +1337,7 @@ func TestNewReaderFromWriter(t *testing.T) {
 	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	r := NewReaderFromWriter(w)
-	result, err := r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result == nil {
 		t.Fatal("expected result from reader-from-writer, got nil")
 	}
@@ -1580,7 +1645,7 @@ func TestUpsertThenClearMappings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertEntity: %v", err)
 	}
-	result, _ := r.LookupByProperty(345, "tt1")
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result == nil {
 		t.Fatal("expected entity to exist")
 	}
@@ -1591,18 +1656,12 @@ func TestUpsertThenClearMappings(t *testing.T) {
 		t.Fatalf("UpsertEntity empty: %v", err)
 	}
 
-	result, err = r.LookupByProperty(345, "tt1")
-	if err != nil {
-		t.Fatalf("LookupByProperty after clear: %v", err)
-	}
+	result = testLookupFirst(t, r, 345, "tt1")
 	if result != nil {
 		t.Error("expected property index to be cleared")
 	}
 
-	result, err = r.LookupByProperty(4947, "100")
-	if err != nil {
-		t.Fatalf("LookupByProperty P4947 after clear: %v", err)
-	}
+	result = testLookupFirst(t, r, 4947, "100")
 	if result != nil {
 		t.Error("expected second property index to be cleared")
 	}
@@ -1628,7 +1687,7 @@ func TestEmptyMappingsVsDelete(t *testing.T) {
 	}
 
 	// Property index should be gone.
-	result, _ := r.LookupByProperty(345, "tt1")
+	result := testLookupFirst(t, r, 345, "tt1")
 	if result != nil {
 		t.Error("expected property index cleared after empty-mappings upsert")
 	}
@@ -2107,10 +2166,7 @@ func TestUpsertDrainRemainingNew(t *testing.T) {
 		prop int
 		val  string
 	}{{2, "b"}, {3, "c"}} {
-		result, err := r.LookupByProperty(tc.prop, tc.val)
-		if err != nil {
-			t.Fatalf("LookupByProperty P%d:%s: %v", tc.prop, tc.val, err)
-		}
+		result := testLookupFirst(t, r, tc.prop, tc.val)
 		if result == nil || result.WikidataID != 1 {
 			t.Errorf("P%d:%s: expected Q1, got %+v", tc.prop, tc.val, result)
 		}
@@ -2133,10 +2189,7 @@ func TestUpsertDrainRemainingOld(t *testing.T) {
 		t.Fatalf("UpsertEntity (drain old): %v", err)
 	}
 
-	result, err := r.LookupByProperty(1, "a")
-	if err != nil {
-		t.Fatalf("LookupByProperty P1:a: %v", err)
-	}
+	result := testLookupFirst(t, r, 1, "a")
 	if result == nil || result.WikidataID != 1 {
 		t.Errorf("P1:a: expected Q1, got %+v", result)
 	}
@@ -2145,10 +2198,7 @@ func TestUpsertDrainRemainingOld(t *testing.T) {
 		prop int
 		val  string
 	}{{2, "b"}, {3, "c"}} {
-		result, err := r.LookupByProperty(tc.prop, tc.val)
-		if err != nil {
-			t.Fatalf("LookupByProperty P%d:%s: %v", tc.prop, tc.val, err)
-		}
+		result := testLookupFirst(t, r, tc.prop, tc.val)
 		if result != nil {
 			t.Errorf("P%d:%s: expected nil (removed), got %+v", tc.prop, tc.val, result)
 		}
@@ -2175,10 +2225,7 @@ func TestUpsertCompleteReplacement(t *testing.T) {
 		prop int
 		val  string
 	}{{1, "x"}, {2, "y"}} {
-		result, err := r.LookupByProperty(tc.prop, tc.val)
-		if err != nil {
-			t.Fatalf("LookupByProperty P%d:%s: %v", tc.prop, tc.val, err)
-		}
+		result := testLookupFirst(t, r, tc.prop, tc.val)
 		if result != nil {
 			t.Errorf("P%d:%s: expected nil (removed), got %+v", tc.prop, tc.val, result)
 		}
@@ -2189,10 +2236,7 @@ func TestUpsertCompleteReplacement(t *testing.T) {
 		prop int
 		val  string
 	}{{3, "a"}, {4, "b"}} {
-		result, err := r.LookupByProperty(tc.prop, tc.val)
-		if err != nil {
-			t.Fatalf("LookupByProperty P%d:%s: %v", tc.prop, tc.val, err)
-		}
+		result := testLookupFirst(t, r, tc.prop, tc.val)
 		if result == nil || result.WikidataID != 1 {
 			t.Errorf("P%d:%s: expected Q1, got %+v", tc.prop, tc.val, result)
 		}

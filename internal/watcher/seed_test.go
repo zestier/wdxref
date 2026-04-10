@@ -20,6 +20,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/goccy/go-json"
 
+	"github.com/ekeid/ekeid/internal/model"
 	"github.com/ekeid/ekeid/internal/store"
 )
 
@@ -37,6 +38,19 @@ func newTestStoreWriter(t *testing.T) (*store.Writer, *store.Reader) {
 	}
 	r := store.NewReaderFromWriter(w)
 	return w, r
+}
+
+// lookupFirst calls LookupByProperty and returns the first result, or nil.
+func lookupFirst(t *testing.T, r *store.Reader, property int, value string) *model.LookupResult {
+	t.Helper()
+	results, err := r.LookupByProperty(property, value)
+	if err != nil {
+		t.Fatalf("LookupByProperty(%d, %q): %v", property, value, err)
+	}
+	if len(results) == 0 {
+		return nil
+	}
+	return &results[0]
 }
 
 // testWriterUpsertEntity is a test helper that wraps Pipe for convenience.
@@ -304,10 +318,7 @@ func TestProcessDumpStream(t *testing.T) {
 		t.Errorf("lines = %d, want >= 4", lines)
 	}
 
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected movie to be found")
 	}
@@ -315,10 +326,7 @@ func TestProcessDumpStream(t *testing.T) {
 		t.Errorf("WikidataID = %d, want 172241", result.WikidataID)
 	}
 
-	result, err = reader.LookupByProperty(345, "tt0903747")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result = lookupFirst(t, reader, 345, "tt0903747")
 	if result == nil {
 		t.Fatal("expected TV series to be found")
 	}
@@ -471,10 +479,7 @@ func TestProcessDumpStream_RetriesSeedBatchWrite(t *testing.T) {
 		t.Fatal("expected at least one retry before seed batch succeeded")
 	}
 
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected entity to be present after retry succeeded")
 	}
@@ -573,10 +578,7 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 		t.Fatalf("Seed: %v", err)
 	}
 
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected entity to be found")
 	}
@@ -742,19 +744,13 @@ func TestSeederSeedFlushesExistingData(t *testing.T) {
 	}
 
 	// The imported entity should exist
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty imported: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected imported entity to exist")
 	}
 
 	// The pre-existing entity should be gone (flushed)
-	stale, err := reader.LookupByProperty(345, "tt9999999")
-	if err != nil {
-		t.Fatalf("LookupByProperty stale: %v", err)
-	}
+	stale := lookupFirst(t, reader, 345, "tt9999999")
 	if stale != nil {
 		t.Error("expected pre-existing entity to be removed after seed flush")
 	}
@@ -938,10 +934,7 @@ func TestSeederSeedResumesOnDrop(t *testing.T) {
 		t.Errorf("expected at least 2 requests (initial + resume), got %d", requestCount.Load())
 	}
 
-	result, err := reader.LookupByProperty(345, "tt0111161")
-	if err != nil {
-		t.Fatalf("LookupByProperty: %v", err)
-	}
+	result := lookupFirst(t, reader, 345, "tt0111161")
 	if result == nil {
 		t.Fatal("expected entity to be found")
 	}

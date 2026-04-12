@@ -3,8 +3,10 @@ package replica
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -37,7 +39,7 @@ func newTestClient(t *testing.T) (*Client, *miniredis.Miniredis, *redis.Client) 
 	rdb := redis.NewClient(&redis.Options{Addr: s.Addr(), Protocol: 2})
 	t.Cleanup(func() { rdb.Close() })
 
-	client := NewClient(w, r, rdb, "http://localhost")
+	client := NewClient(w, r, rdb, "http://localhost", nil)
 	return client, s, rdb
 }
 
@@ -551,6 +553,204 @@ func TestConnectStream_NonOKStatus(t *testing.T) {
 	err := c.connectStream(ctx, "0-0")
 	if err == nil {
 		t.Fatal("expected error on 500")
+	}
+}
+
+func TestConnectStream_SetsAcceptEncoding(t *testing.T) {
+	c, _, _ := newTestClient(t)
+	ctx := context.Background()
+
+	var gotAcceptEncoding string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAcceptEncoding = r.Header.Get("Accept-Encoding")
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+
+	c.upstreamURL = srv.URL
+
+	err := c.connectStream(ctx, "0-0")
+	if err == nil {
+		t.Fatal("expected error on 500")
+	}
+	if gotAcceptEncoding != "zstd, gzip" {
+		t.Fatalf("Accept-Encoding = %q, want %q", gotAcceptEncoding, "zstd, gzip")
+	}
+}
+
+func TestConnectStream_Zstd(t *testing.T) {
+	c, s, _ := newTestClient(t)
+
+	sseBody := fmt.Sprintf(
+		"event: change\ndata: %s\n\n",
+		replicate.FormatStreamChangeData("100-0", 10, `{"213":["v1"]}`),
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "zstd")
+		w.WriteHeader(200)
+
+		zw, err := zstd.NewWriter(w)
+		if err != nil {
+			t.Fatalf("zstd.NewWriter: %v", err)
+		}
+		defer zw.Close()
+
+		if _, err := zw.Write([]byte(sseBody)); err != nil {
+			t.Fatalf("zw.Write: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c.upstreamURL = srv.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.connectStream(ctx, "0-0")
+	if err == nil {
+		t.Fatal("expected error on stream end")
+	}
+
+	if s.HGet("entities", "10") == "" {
+		t.Error("expected entity 10 to exist")
+	}
+	if lastID := s.HGet("meta", "last_replicated_id"); lastID != "100-0" {
+		t.Errorf("last_replicated_id = %q, want 100-0", lastID)
+	}
+}
+
+func TestConnectStream_Gzip(t *testing.T) {
+	c, s, _ := newTestClient(t)
+
+	sseBody := fmt.Sprintf(
+		"event: change\ndata: %s\n\n",
+		replicate.FormatStreamChangeData("100-0", 10, `{"213":["v1"]}`),
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+
+		zw := gzip.NewWriter(w)
+		defer zw.Close()
+
+		if _, err := zw.Write([]byte(sseBody)); err != nil {
+			t.Fatalf("zw.Write: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c.upstreamURL = srv.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.connectStream(ctx, "0-0")
+	if err == nil {
+		t.Fatal("expected error on stream end")
+	}
+
+	if s.HGet("entities", "10") == "" {
+		t.Error("expected entity 10 to exist")
+	}
+	if lastID := s.HGet("meta", "last_replicated_id"); lastID != "100-0" {
+		t.Errorf("last_replicated_id = %q, want 100-0", lastID)
+	}
+}
+
+func TestOpenStreamBody_Identity(t *testing.T) {
+	body := io.NopCloser(bytes.NewBufferString("abc"))
+	resp := &http.Response{Body: body, Header: make(http.Header)}
+
+	rc, err := openStreamBody(resp)
+	if err != nil {
+		t.Fatalf("openStreamBody: %v", err)
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := string(data); got != "abc" {
+		t.Fatalf("body = %q, want %q", got, "abc")
+	}
+}
+
+func TestOpenStreamBody_Gzip(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write([]byte("gzip-body")); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	resp := &http.Response{
+		Body:   io.NopCloser(bytes.NewReader(buf.Bytes())),
+		Header: http.Header{"Content-Encoding": []string{"gzip"}},
+	}
+
+	rc, err := openStreamBody(resp)
+	if err != nil {
+		t.Fatalf("openStreamBody: %v", err)
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := string(data); got != "gzip-body" {
+		t.Fatalf("body = %q, want %q", got, "gzip-body")
+	}
+}
+
+func TestOpenStreamBody_Zstd(t *testing.T) {
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter: %v", err)
+	}
+	if _, err := zw.Write([]byte("zstd-body")); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+
+	resp := &http.Response{
+		Body:   io.NopCloser(bytes.NewReader(buf.Bytes())),
+		Header: http.Header{"Content-Encoding": []string{"zstd"}},
+	}
+
+	rc, err := openStreamBody(resp)
+	if err != nil {
+		t.Fatalf("openStreamBody: %v", err)
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := string(data); got != "zstd-body" {
+		t.Fatalf("body = %q, want %q", got, "zstd-body")
+	}
+}
+
+func TestOpenStreamBody_UnsupportedEncoding(t *testing.T) {
+	resp := &http.Response{
+		Body:   io.NopCloser(bytes.NewBufferString("abc")),
+		Header: http.Header{"Content-Encoding": []string{"br"}},
+	}
+
+	if _, err := openStreamBody(resp); err == nil {
+		t.Fatal("expected error for unsupported encoding")
 	}
 }
 

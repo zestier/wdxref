@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/replicate"
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -86,7 +87,9 @@ func main() {
 	// Run changelog trimmer in background.
 	go replicate.RunChangelogTrimmer(ctx, reader, changelogRetention)
 
-	handler := replicate.Handler(reader, snapshot)
+	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
+
+	handler := replicate.Handler(reader, snapshot, encodings)
 
 	httpServer := &http.Server{
 		Addr:         addr,

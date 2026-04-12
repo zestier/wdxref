@@ -6,9 +6,13 @@ A self-hosted service that builds and maintains a local cache of external identi
 
 ## Why
 
-Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. Querying these mappings live via the Wikidata API or SPARQL endpoint can be slow and rate-limited. ekeid solves this by maintaining a local [Kvrocks](https://kvrocks.apache.org/) database (a Redis-compatible, disk-backed key-value store) that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API.
+Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. If your application needs to translate between these ID systems ("given this IMDb ID, what's the TMDB ID?"), the usual options are live SPARQL queries or Wikidata API calls — both of which can be slow, rate-limited, and unpredictable under load.
 
-If requested I would probably be willing to host a public instance, but keep in mind that it is unlikely that its performance would exceed directly using a SPARQL query to Wikidata. Where this project is most useful is adding it to a stack that wants to do this kind of remapping quickly and without risking excessive unpredictable spikes in SPARQL queries likely to get you throttled, such as the backend for an application that uses this kind of remapping to satisfy user interactions that desire being as responsive as possible.
+ekeid gives you a local, always-ready lookup service. It maintains a [Kvrocks](https://kvrocks.apache.org/) database (a Redis-compatible, disk-backed key-value store) that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API. Lookups resolve in single-digit milliseconds with no external network calls, making it suitable for user-facing applications where responsiveness matters.
+
+The typical use case is adding ekeid to a stack that needs fast, reliable ID remapping — for example, a media server that wants to cross-reference content across IMDb, TMDB, TVDB, and MusicBrainz without hammering upstream APIs or risking throttling during traffic spikes.
+
+> **Planned feature:** Built-in property aliasing, so you can look up by friendly names like `imdb` or `tmdb` instead of needing to know the Wikidata property IDs (`P345`, `P4947`, etc.).
 
 ## Architecture
 
@@ -116,8 +120,10 @@ Configuration is done through environment variables:
 | `LISTEN_ADDR` | API, Replicator | `:8080`, `:8081` | Address to listen on |
 | `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
 | `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
-| `SNAPSHOT_INTERVAL` | Replicator | `1d` | How often to regenerate the snapshot |
-| `CHANGELOG_RETENTION` | Replicator | `168h` | How long to retain changelog entries (default: 7 days) |
+| `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |
+| `CHANGELOG_RETENTION` | Replicator | `168h` | How long to retain changelog entries; also accepts a plain integer as hours |
+| `ENCODINGS` | API, Replica, Replicator | `zstd,gzip` | Comma-separated list of compression encodings to use; set to empty to disable compression |
+| `DISABLE_CHANGELOG` | Replica | `false` | Disable writing to the local changelog (prevents downstream chaining) |
 
 ### Running
 

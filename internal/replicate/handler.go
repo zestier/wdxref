@@ -7,6 +7,7 @@ import (
 
 	"github.com/goccy/go-json"
 
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/store"
 )
 
@@ -26,18 +27,18 @@ type healthResponse struct {
 //	GET /replicate/snapshot  — pre-generated entity snapshot (zstd line format)
 //	GET /replicate/stream    — SSE changelog stream
 //	GET /replicate/health    — replication status
-func Handler(reader *store.Reader, snapshot *SnapshotGenerator) http.Handler {
+func Handler(reader *store.Reader, snapshot *SnapshotGenerator, encodings []string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /replicate/snapshot", snapshot.ServeSnapshot)
 
-	mux.HandleFunc("GET /replicate/stream", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /replicate/stream", httpencoding.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ServeStream(reader, w, r)
-	})
+	}), encodings))
 
-	mux.HandleFunc("GET /replicate/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /replicate/health", httpencoding.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveHealth(reader, snapshot, w)
-	})
+	}), encodings))
 
 	return mux
 }

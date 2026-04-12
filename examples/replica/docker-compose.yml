@@ -59,7 +59,7 @@ services:
       kvrocks:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "8090:8080"
     environment:
       - KVROCKS_ADDR=kvrocks:6666
       - LISTEN_ADDR=:8080

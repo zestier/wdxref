@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ekeid/ekeid/internal/api"
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/store"
 )
 
@@ -35,7 +36,9 @@ func main() {
 
 	reader := store.NewReader(client)
 
-	srv := api.NewServer(reader, version)
+	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
+
+	srv := api.NewServer(reader, version, encodings)
 
 	httpServer := &http.Server{
 		Addr:         addr,

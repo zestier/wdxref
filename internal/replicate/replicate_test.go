@@ -2,6 +2,7 @@ package replicate
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -193,7 +194,7 @@ func TestServeStream(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap)
+	handler := Handler(reader, snap, nil)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -212,7 +213,7 @@ func TestServeStream(t *testing.T) {
 	t.Run("reset_when_no_retained_entries", func(t *testing.T) {
 		_, reader2, _, _ := testSetup(t)
 		snap2 := NewSnapshotGenerator(reader2, t.TempDir(), time.Hour)
-		handler2 := Handler(reader2, snap2)
+		handler2 := Handler(reader2, snap2, nil)
 		server2 := httptest.NewServer(handler2)
 		defer server2.Close()
 
@@ -260,7 +261,7 @@ func TestServeStreamEvents(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap)
+	handler := Handler(reader, snap, nil)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -289,6 +290,158 @@ func TestServeStreamEvents(t *testing.T) {
 	// Should contain the second entry (after since=100-0).
 	if !strings.Contains(s, "tt0111162") {
 		t.Errorf("expected second entity data, got: %s", s)
+	}
+}
+
+func TestServeStreamEvents_Zstd(t *testing.T) {
+	ms := miniredis.RunT(t)
+	c, err := store.NewClient(ms.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	w := store.NewWriter(c)
+	if err := w.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+	reader := store.NewReaderFromWriter(w)
+	rdb := c.Redis()
+	ctx := context.Background()
+
+	rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "100-0",
+		Values: map[string]interface{}{"q": "42", "a": "upsert", "m": `["P345:tt0111161"]`},
+	})
+	rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "200-0",
+		Values: map[string]interface{}{"q": "43", "a": "upsert", "m": `["P345:tt0111162"]`},
+	})
+
+	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
+	handler := Handler(reader, snap, nil)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		ms.Close()
+	}()
+
+	req, err := http.NewRequest("GET", server.URL+"/replicate/stream?since=100-0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if ce := resp.Header.Get("Content-Encoding"); ce != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", ce)
+	}
+
+	zr, err := zstd.NewReader(resp.Body)
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	s := string(body)
+	if !strings.Contains(s, "event: change") {
+		t.Errorf("expected change event, got: %s", s)
+	}
+	if !strings.Contains(s, "tt0111162") {
+		t.Errorf("expected second entity data, got: %s", s)
+	}
+	if values := resp.Header.Values("Vary"); len(values) == 0 || !strings.Contains(strings.Join(values, ","), "Accept-Encoding") {
+		t.Errorf("Vary = %v, want Accept-Encoding", values)
+	}
+}
+
+func TestServeStreamEvents_Gzip(t *testing.T) {
+	ms := miniredis.RunT(t)
+	c, err := store.NewClient(ms.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	w := store.NewWriter(c)
+	if err := w.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+	reader := store.NewReaderFromWriter(w)
+	rdb := c.Redis()
+	ctx := context.Background()
+
+	rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "100-0",
+		Values: map[string]interface{}{"q": "42", "a": "upsert", "m": `["P345:tt0111161"]`},
+	})
+	rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     "200-0",
+		Values: map[string]interface{}{"q": "43", "a": "upsert", "m": `["P345:tt0111162"]`},
+	})
+
+	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
+	handler := Handler(reader, snap, nil)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		ms.Close()
+	}()
+
+	req, err := http.NewRequest("GET", server.URL+"/replicate/stream?since=100-0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if ce := resp.Header.Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", ce)
+	}
+
+	zr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	s := string(body)
+	if !strings.Contains(s, "event: change") {
+		t.Errorf("expected change event, got: %s", s)
+	}
+	if !strings.Contains(s, "tt0111162") {
+		t.Errorf("expected second entity data, got: %s", s)
+	}
+	if values := resp.Header.Values("Vary"); len(values) == 0 || !strings.Contains(strings.Join(values, ","), "Accept-Encoding") {
+		t.Errorf("Vary = %v, want Accept-Encoding", values)
 	}
 }
 
@@ -428,7 +581,7 @@ func TestSnapshotGenerationSkipsEmptyChangelog(t *testing.T) {
 }
 
 func TestSnapshotGenerationInvalidatesStaleSnapshot(t *testing.T) {
-	w, reader, _, _ := testSetup(t)
+	w, reader, rdb, _ := testSetup(t)
 	ctx := context.Background()
 
 	// Create initial entities and a snapshot.
@@ -454,6 +607,20 @@ func TestSnapshotGenerationInvalidatesStaleSnapshot(t *testing.T) {
 	}
 	testUpsertEntity(t, w, "Q2", []string{"P345:tt0000002"})
 	testSetSyncState(t, w, "state", "streaming")
+
+	// Make stale-ness unambiguous under the "equal is current" policy by
+	// rewriting changelog so its first ID is strictly greater than oldMeta.ID.
+	nextID := fmt.Sprintf("%d-0", parseStreamIDMs(oldMeta.ID)+1)
+	if err := rdb.Del(ctx, "changelog").Err(); err != nil {
+		t.Fatalf("DEL changelog: %v", err)
+	}
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "changelog",
+		ID:     nextID,
+		Values: map[string]interface{}{"q": "2", "a": "upsert", "m": "{}"},
+	}).Err(); err != nil {
+		t.Fatalf("XADD changelog: %v", err)
+	}
 
 	// ServeSnapshot should detect the stale snapshot and return 503,
 	// signalling the Run loop to regenerate.
@@ -673,7 +840,7 @@ func TestServeSnapshot(t *testing.T) {
 	// Add a changelog entry so the snapshot's stream ID is considered current.
 	rdb.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: "changelog",
-		ID:     "500-0",
+		ID:     "400-0",
 		Values: map[string]interface{}{"q": "1", "a": "upsert", "m": "{}"},
 	})
 
@@ -747,7 +914,7 @@ func TestServeSnapshotResume(t *testing.T) {
 	// Add a changelog entry so the snapshot's stream ID is considered current.
 	rdb.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: "changelog",
-		ID:     "500-0",
+		ID:     "400-0",
 		Values: map[string]interface{}{"q": "1", "a": "upsert", "m": "{}"},
 	})
 

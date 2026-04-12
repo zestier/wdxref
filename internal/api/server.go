@@ -11,6 +11,7 @@ import (
 
 	"github.com/goccy/go-json"
 
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/model"
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -19,13 +20,15 @@ const apiReadTimeout = 5 * time.Second
 
 // Server holds dependencies for the API handlers.
 type Server struct {
-	reader  *store.Reader
-	version string
+	reader    *store.Reader
+	version   string
+	encodings []string
 }
 
-// NewServer creates a new API server.
-func NewServer(reader *store.Reader, version string) *Server {
-	return &Server{reader: reader, version: version}
+// NewServer creates a new API server. The encodings parameter controls which
+// compression encodings the server will offer (nil = defaults).
+func NewServer(reader *store.Reader, version string, encodings []string) *Server {
+	return &Server{reader: reader, version: version, encodings: encodings}
 }
 
 // Handler returns the top-level HTTP handler with all routes and middleware.
@@ -41,6 +44,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) applyMiddleware(next http.Handler) http.Handler {
+	compressed := httpencoding.Middleware(next, s.encodings)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// CORS headers
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -52,7 +57,7 @@ func (s *Server) applyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		compressed.ServeHTTP(w, r)
 	})
 }
 

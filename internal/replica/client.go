@@ -5,9 +5,11 @@ package replica
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -19,6 +21,7 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/replicate"
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -42,10 +45,12 @@ type Client struct {
 	rdb         *redis.Client
 	upstreamURL string
 	httpClient  *http.Client
+	encodings   []string
 }
 
-// NewClient creates a new replica client.
-func NewClient(writer *store.Writer, reader *store.Reader, rdb *redis.Client, upstreamURL string) *Client {
+// NewClient creates a new replica client. The encodings parameter controls
+// which compression encodings the client will request (nil = defaults).
+func NewClient(writer *store.Writer, reader *store.Reader, rdb *redis.Client, upstreamURL string, encodings []string) *Client {
 	return &Client{
 		writer:      writer,
 		reader:      reader,
@@ -54,6 +59,7 @@ func NewClient(writer *store.Writer, reader *store.Reader, rdb *redis.Client, up
 		httpClient: &http.Client{
 			Timeout: 0, // No timeout for streaming
 		},
+		encodings: encodings,
 	}
 }
 
@@ -326,6 +332,9 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
+	if acceptEnc := httpencoding.AcceptHeader(c.encodings); acceptEnc != "" {
+		req.Header.Set("Accept-Encoding", acceptEnc)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -337,7 +346,16 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	encoding := streamContentEncoding(resp)
+	slog.Info("replica: stream connected", "content_encoding", encoding)
+
+	body, err := openStreamBody(resp)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var eventType string
@@ -412,6 +430,67 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 		return fmt.Errorf("scan stream: %w", err)
 	}
 	return fmt.Errorf("stream ended unexpectedly")
+}
+
+func openStreamBody(resp *http.Response) (io.ReadCloser, error) {
+	encoding := streamContentEncoding(resp)
+	switch encoding {
+	case "identity":
+		return resp.Body, nil
+	case "zstd":
+		reader, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("open stream zstd: %w", err)
+		}
+
+		return &zstdReadCloser{body: resp.Body, reader: reader}, nil
+	case "gzip":
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("open stream gzip: %w", err)
+		}
+
+		return &gzipReadCloser{body: resp.Body, reader: reader}, nil
+	default:
+		return nil, fmt.Errorf("unsupported stream content encoding %q", encoding)
+	}
+}
+
+func streamContentEncoding(resp *http.Response) string {
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if encoding == "" {
+		return "identity"
+	}
+
+	return encoding
+}
+
+type zstdReadCloser struct {
+	body   io.Closer
+	reader *zstd.Decoder
+}
+
+func (r *zstdReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *zstdReadCloser) Close() error {
+	r.reader.Close()
+	return r.body.Close()
+}
+
+type gzipReadCloser struct {
+	body   io.Closer
+	reader *gzip.Reader
+}
+
+func (r *gzipReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *gzipReadCloser) Close() error {
+	_ = r.reader.Close()
+	return r.body.Close()
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) {

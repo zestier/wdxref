@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/replica"
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -45,7 +46,9 @@ func main() {
 
 	reader := store.NewReader(client)
 
-	replicaClient := replica.NewClient(writer, reader, client.Redis(), upstreamURL)
+	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
+
+	replicaClient := replica.NewClient(writer, reader, client.Redis(), upstreamURL, encodings)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

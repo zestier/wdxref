@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -9,6 +12,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/goccy/go-json"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -28,7 +32,7 @@ func setupTestServer(t *testing.T) (*Server, *store.Writer) {
 	}
 
 	r := store.NewReader(c)
-	srv := NewServer(r, "0.1.0-test")
+	srv := NewServer(r, "0.1.0-test", nil)
 	return srv, w
 }
 
@@ -467,6 +471,95 @@ func TestCORSPreflight(t *testing.T) {
 	}
 }
 
+func TestHealthCompressionGzip(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("Vary = %q, want Accept-Encoding", got)
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	var resp healthResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("Status = %q, want ok", resp.Status)
+	}
+}
+
+func TestHealthCompressionZstd(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "zstd")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", got)
+	}
+
+	zr, err := zstd.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	var resp healthResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("Status = %q, want ok", resp.Status)
+	}
+}
+
+func TestHealthCompressionPrefersZstdOverGzip(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", got)
+	}
+}
+
 func TestHealthEmptyDB(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
@@ -543,7 +636,7 @@ func setupMismatchedServer(t *testing.T) *Server {
 	testSetSyncState(t, w, "schema_version", "wrong-version")
 
 	r := store.NewReader(c)
-	return NewServer(r, "0.1.0-test")
+	return NewServer(r, "0.1.0-test", nil)
 }
 
 // TestLookupSchemaMismatch503 verifies that /v1/lookup/P…/… returns 503

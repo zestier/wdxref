@@ -25,7 +25,7 @@ const (
 	reconnectDelay     = 5 * time.Second
 	retryInterval      = 10 * time.Minute
 	retryBatchSize     = 50
-	queuePollInterval  = 1 * time.Minute
+	queuePollInterval  = 30 * time.Second
 	enqueueBatchSize   = 1000            // buffer up to N QIDs before flushing to DB
 	enqueueFlushDelay  = 5 * time.Second // max delay before flushing a partial batch
 	streamGapThreshold = 1 * time.Hour

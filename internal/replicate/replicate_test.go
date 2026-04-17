@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -176,6 +177,27 @@ func TestCheckStreamGap(t *testing.T) {
 	}
 }
 
+func TestCheckStreamGap_StoreUnavailable(t *testing.T) {
+	_, _, _, ms := testSetup(t)
+
+	// Create a reader pointed at the miniredis instance, then close it
+	// to simulate kvrocks being down.
+	c2, err := store.NewClient(ms.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	reader2 := store.NewReader(c2)
+	ms.Close()
+
+	err = checkStreamGap(reader2, "100-0")
+	if err == nil {
+		t.Fatal("expected error when store is unavailable")
+	}
+	if !errors.Is(err, errStoreUnavailable) {
+		t.Errorf("expected errStoreUnavailable, got: %v", err)
+	}
+}
+
 // --- ServeStream ---
 
 func TestServeStream(t *testing.T) {
@@ -225,6 +247,32 @@ func TestServeStream(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if !strings.Contains(string(body), "event: reset") {
 			t.Errorf("expected reset event, got: %s", body)
+		}
+	})
+
+	t.Run("503_when_store_unavailable", func(t *testing.T) {
+		_, _, _, ms2 := testSetup(t)
+		c2, err := store.NewClient(ms2.Addr())
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		reader2 := store.NewReader(c2)
+		snap2 := NewSnapshotGenerator(reader2, t.TempDir(), time.Hour)
+		handler2 := Handler(reader2, snap2, nil)
+		server2 := httptest.NewServer(handler2)
+		defer server2.Close()
+
+		// Close miniredis to simulate kvrocks being unavailable.
+		ms2.Close()
+
+		resp, err := http.Get(server2.URL + "/replicate/stream?since=100-0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("expected 503, got %d: %s", resp.StatusCode, body)
 		}
 	})
 

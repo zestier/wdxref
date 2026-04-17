@@ -2,6 +2,7 @@ package replicate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -33,6 +34,15 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 
 	// Check if since is too old (before oldest retained entry).
 	if err := checkStreamGap(reader, since); err != nil {
+		// If the backing store is unreachable, return 503 so the replica
+		// retries without purging its data. Only send a reset for genuine
+		// coverage gaps.
+		if errors.Is(err, errStoreUnavailable) {
+			slog.Warn("stream: store unavailable, returning 503", "error", err)
+			http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -92,9 +102,16 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// errStoreUnavailable is returned by checkStreamGap when the backing store
+// cannot be reached (e.g. kvrocks is restarting). ServeStream uses this to
+// respond with 503 instead of sending a destructive reset event.
+var errStoreUnavailable = fmt.Errorf("store unavailable")
+
 // checkStreamGap returns an error unless the changelog retention can prove
 // coverage for `since`. This forces reset when the stream is empty/missing,
 // and when `since` is older than the oldest retained entry.
+// It returns errStoreUnavailable when the backing store is unreachable, which
+// callers should treat differently from a genuine coverage gap.
 func checkStreamGap(reader *store.Reader, since string) error {
 	if since == "0" || since == "0-0" {
 		// Always reset for since=0 (initial connection).
@@ -103,7 +120,7 @@ func checkStreamGap(reader *store.Reader, since string) error {
 
 	firstID, _, _, err := reader.StreamInfo()
 	if err != nil {
-		return fmt.Errorf("cannot verify stream coverage for since %s: %w", since, err)
+		return fmt.Errorf("cannot verify stream coverage for since %s: %w", since, errStoreUnavailable)
 	}
 	if firstID == "" {
 		return fmt.Errorf("no retained entries available for since %s", since)

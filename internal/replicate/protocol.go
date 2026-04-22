@@ -32,9 +32,6 @@ const (
 	// to stay open before the server closes it, forcing a reconnect.
 	MaxConnectionDuration = 15 * time.Minute
 
-	// DefaultChangelogRetention is how long changelog entries are kept.
-	DefaultChangelogRetention = 168 * time.Hour // 7 days
-
 	// SnapshotFrameSize is the target number of entity lines per zstd frame in
 	// the snapshot. Each frame begins with a checkpoint control line and is
 	// independently decompressible.

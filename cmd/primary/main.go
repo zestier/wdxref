@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -38,6 +39,20 @@ func main() {
 
 	writer := store.NewWriter(client)
 
+	changelogRetention := store.DefaultChangelogRetention
+	if v := os.Getenv("CHANGELOG_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			h, herr := strconv.Atoi(v)
+			if herr != nil {
+				slog.Error("invalid CHANGELOG_RETENTION", "value", v, "error", err)
+				os.Exit(1)
+			}
+			d = time.Duration(h) * time.Hour
+		}
+		changelogRetention = d
+	}
+
 	if err := writer.MigrateSchema(); err != nil {
 		slog.Error("failed to migrate schema", "error", err)
 		os.Exit(1)
@@ -54,6 +69,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go store.RunChangelogTrimmer(ctx, writer, changelogRetention)
 
 	sseClient := &http.Client{Timeout: 0, Transport: transport}
 	esWatcher := watcher.NewEventStreamWatcher(processor, writer, reader, sseClient)

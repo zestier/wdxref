@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/ekeid/ekeid/internal/httpencoding"
 	"github.com/ekeid/ekeid/internal/replica"
@@ -34,9 +35,18 @@ func main() {
 
 	writer := store.NewWriter(client)
 
-	if v, _ := strconv.ParseBool(os.Getenv("DISABLE_CHANGELOG")); v {
-		writer.SetNoChangelog(true)
-		slog.Info("changelog disabled for this replica")
+	changelogRetention := store.DefaultChangelogRetention
+	if v := os.Getenv("CHANGELOG_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			h, herr := strconv.Atoi(v)
+			if herr != nil {
+				slog.Error("invalid CHANGELOG_RETENTION", "value", v, "error", err)
+				os.Exit(1)
+			}
+			d = time.Duration(h) * time.Hour
+		}
+		changelogRetention = d
 	}
 
 	if err := writer.MigrateSchema(); err != nil {
@@ -52,6 +62,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go store.RunChangelogTrimmer(ctx, writer, changelogRetention)
 
 	slog.Info("replica starting", "upstream", upstreamURL, "kvrocks", kvrocksAddr)
 	if err := replicaClient.Run(ctx); err != nil && ctx.Err() == nil {

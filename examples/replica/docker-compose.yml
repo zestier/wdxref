@@ -47,7 +47,7 @@ services:
     environment:
       - KVROCKS_ADDR=kvrocks:6666
       - UPSTREAM_URL=${UPSTREAM_URL:?Set UPSTREAM_URL to the upstream replicator (e.g. http://primary-host:8081)}
-      - DISABLE_CHANGELOG=1
+      - CHANGELOG_RETENTION=0
 
   api:
     build:

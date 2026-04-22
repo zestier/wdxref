@@ -26,19 +26,17 @@ const (
 // Writer provides read-write access to Kvrocks (used by the primary and replica).
 type Writer struct {
 	rdb           *redis.Client
-	noChangelog   bool
 	scriptsMu     sync.Mutex
 	scriptsLoaded atomic.Bool
 }
 
 // Lua scripts executed atomically on the server.
 //
-// upsertScript: KEYS = [changelog], ARGV = [new_m, eid, no_changelog]
+// upsertScript: KEYS = [changelog], ARGV = [new_m, eid]
 //
 //	Reads old entity from the "entities" hash, compares mappings string.
-//	If unchanged, returns 0. If changed, rewrites indexes, optionally
-//	appends to changelog, and updates counters.
-//	Pass ARGV[3]="1" to skip the changelog XADD.
+//	If unchanged, returns 0. If changed, rewrites indexes, appends to the
+//	changelog, and updates counters.
 //	Mappings are stored as a flat JSON array of "P<id>:<value>" strings.
 var upsertScript = redis.NewScript(`
 local old_m = redis.call('HGET', 'entities', ARGV[2])
@@ -115,9 +113,7 @@ else
   end
 end
 
-if ARGV[3] ~= '1' then
-  redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', new_m)
-end
+redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', new_m)
 
 if is_new then
   redis.call('HINCRBY', 'meta', 'entity_count', 1)
@@ -126,12 +122,11 @@ end
 return 1
 `)
 
-// deleteScript: KEYS = [changelog], ARGV = [eid, no_changelog]
+// deleteScript: KEYS = [changelog], ARGV = [eid]
 //
-//	Reads entity from the "entities" hash, removes indexes, optionally
-//	appends delete to changelog, updates counters. Returns 0 if entity
-//	was already gone.
-//	Pass ARGV[2]="1" to skip the changelog XADD.
+//	Reads entity from the "entities" hash, removes indexes, appends
+//	delete to changelog, updates counters. Returns 0 if entity was
+//	already gone.
 var deleteScript = redis.NewScript(`
 local eid = ARGV[1]
 local old_m = redis.call('HGET', 'entities', eid)
@@ -159,9 +154,7 @@ for _, entry in ipairs(old) do
   end
 end
 
-if ARGV[2] ~= '1' then
-  redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', '')
-end
+redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', '')
 
 redis.call('HINCRBY', 'meta', 'entity_count', -1)
 
@@ -171,21 +164,6 @@ return 1
 // NewWriter creates a Writer that connects to Kvrocks via the given Client.
 func NewWriter(c *Client) *Writer {
 	return &Writer{rdb: c.Redis()}
-}
-
-// SetNoChangelog disables changelog writes for all upsert/delete operations.
-// This is intended for leaf replicas that will never be replicated from.
-func (w *Writer) SetNoChangelog(v bool) {
-	w.noChangelog = v
-}
-
-// noChangelogFlag returns "1" when changelog writes are disabled, "0" otherwise.
-// Passed as the final ARGV to the upsert/delete Lua scripts.
-func (w *Writer) noChangelogFlag() string {
-	if w.noChangelog {
-		return "1"
-	}
-	return "0"
 }
 
 // loadScripts ensures all Lua scripts are loaded into the server cache.
@@ -268,7 +246,7 @@ func (p *Pipe) UpsertRawEntity(rec RawEntityRecord) {
 		return
 	}
 	eid := strconv.FormatInt(id, 10)
-	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), rec.RawMappings, eid, p.w.noChangelogFlag())
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), rec.RawMappings, eid)
 }
 
 // UpsertEntity queues an upsert of an entity, encoding its mappings to
@@ -290,7 +268,7 @@ func (p *Pipe) UpsertEntity(rec EntityRecord) {
 	}
 	mJSON := canonicalMappingsJSON(rec.Mappings)
 	eid := strconv.FormatInt(id, 10)
-	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), mJSON, eid, p.w.noChangelogFlag())
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), mJSON, eid)
 }
 
 // DeleteEntity queues a delete of an entity by QID string (e.g. "Q123").
@@ -304,7 +282,7 @@ func (p *Pipe) DeleteEntity(qid string) {
 		return
 	}
 	eid := strconv.FormatInt(id, 10)
-	deleteScript.Run(p.ctx, p.pipe, scriptKeys(), eid, p.w.noChangelogFlag())
+	deleteScript.Run(p.ctx, p.pipe, scriptKeys(), eid)
 }
 
 // SetSyncState queues an HSET on the meta hash.
@@ -442,6 +420,48 @@ func (w *Writer) FlushDataContext(ctx context.Context) error {
 		return fmt.Errorf("flush database: %w", err)
 	}
 	return w.rdb.HSet(ctx, metaKey, "schema_version", SchemaVersion()).Err()
+}
+
+const (
+	// DefaultChangelogRetention is how long changelog entries are kept.
+	DefaultChangelogRetention = 168 * time.Hour // 7 days
+
+	trimBatchSize    = 1000
+	trimInterval     = 1 * time.Minute
+	trimBacklogDelay = 1 * time.Second
+	trimErrorDelay   = 5 * time.Minute
+)
+
+// RunChangelogTrimmer periodically trims the changelog stream, removing
+// entries older than the retention period. It adapts its tick rate: when a
+// full batch is removed (backlog), the next tick fires quickly; otherwise
+// it waits trimInterval. On errors it backs off before retrying.
+func RunChangelogTrimmer(ctx context.Context, w *Writer, retention time.Duration) {
+	timer := time.NewTimer(trimInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			cutoff := time.Now().Add(-retention)
+			minID := fmt.Sprintf("%d-0", cutoff.UnixMilli())
+			n, err := w.StreamTrimOlderThan(ctx, minID, trimBatchSize)
+			if err != nil {
+				slog.Error("trimmer: trim failed", "error", err)
+				timer.Reset(trimErrorDelay)
+			} else if n >= trimBatchSize {
+				slog.Info("trimmer: trimmed old entries (backlog)", "removed", n, "retention", retention)
+				timer.Reset(trimBacklogDelay)
+			} else {
+				if n > 0 {
+					slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
+				}
+				timer.Reset(trimInterval)
+			}
+		}
+	}
 }
 
 // TrimChangelog removes all entries from the changelog stream.

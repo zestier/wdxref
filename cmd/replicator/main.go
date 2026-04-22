@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -42,26 +41,6 @@ func main() {
 		snapshotInterval = d
 	}
 
-	changelogRetention := replicate.DefaultChangelogRetention
-	if v := os.Getenv("CHANGELOG_RETENTION"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			// Try parsing as hours integer for convenience.
-			h, herr := strconv.Atoi(v)
-			if herr != nil {
-				slog.Error("invalid CHANGELOG_RETENTION", "value", v, "error", err)
-				os.Exit(1)
-			}
-			d = time.Duration(h) * time.Hour
-		}
-		changelogRetention = d
-	}
-
-	if changelogRetention < 2*snapshotInterval {
-		slog.Warn("changelog retention is less than 2x snapshot interval; replicas may enter reset loops",
-			"retention", changelogRetention, "snapshot_interval", snapshotInterval)
-	}
-
 	client, err := store.NewClient(kvrocksAddr)
 	if err != nil {
 		slog.Error("failed to connect to kvrocks", "error", err)
@@ -70,7 +49,6 @@ func main() {
 	defer client.Close()
 
 	reader := store.NewReader(client)
-	writer := store.NewWriter(client)
 
 	// Ensure snapshot directory exists.
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
@@ -85,9 +63,6 @@ func main() {
 
 	// Run snapshot generator in background.
 	go snapshot.Run(ctx)
-
-	// Run changelog trimmer in background.
-	go replicate.RunChangelogTrimmer(ctx, writer, changelogRetention)
 
 	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
 
@@ -105,7 +80,7 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("replicator starting", "addr", addr, "snapshot_interval", snapshotInterval, "changelog_retention", changelogRetention)
+		slog.Info("replicator starting", "addr", addr, "snapshot_interval", snapshotInterval)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
 			os.Exit(1)

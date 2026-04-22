@@ -121,9 +121,8 @@ Configuration is done through environment variables:
 | `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
 | `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
 | `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |
-| `CHANGELOG_RETENTION` | Replicator | `168h` | How long to retain changelog entries; also accepts a plain integer as hours |
+| `CHANGELOG_RETENTION` | Primary, Replica | `168h` | How long to retain changelog entries; `0` trims entries on every tick (effectively disabled for leaf replicas); also accepts a plain integer as hours |
 | `ENCODINGS` | API, Replica, Replicator | `zstd,gzip` | Comma-separated list of compression encodings to use; set to empty to disable compression |
-| `DISABLE_CHANGELOG` | Replica | `false` | Disable writing to the local changelog (prevents downstream chaining) |
 
 ### Running
 

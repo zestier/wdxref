@@ -1,7 +1,6 @@
 package replicate
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -165,52 +164,4 @@ func compareStreamIDs(a, b string) int {
 		return 1
 	}
 	return 0
-}
-
-// trimBatchSize is the number of entries removed per trim tick.
-const trimBatchSize = 1000
-
-// trimInterval is the base interval between trim ticks when the trimmer
-// is caught up. When a full batch is trimmed (indicating a backlog), the
-// next tick fires after trimBacklogDelay instead.
-const trimInterval = 1 * time.Minute
-const trimBacklogDelay = 1 * time.Second
-const trimErrorDelay = 5 * time.Minute
-
-// TrimChangelog trims changelog entries older than the retention period,
-// removing up to trimBatchSize entries per call.
-func TrimChangelog(ctx context.Context, writer *store.Writer, retention time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-retention)
-	minID := fmt.Sprintf("%d-0", cutoff.UnixMilli())
-	return writer.StreamTrimOlderThan(ctx, minID, trimBatchSize)
-}
-
-// RunChangelogTrimmer periodically trims the changelog stream. It adapts
-// its tick rate: when a full batch is removed (backlog), the next tick
-// fires after trimBacklogDelay; otherwise it waits trimInterval. On errors
-// it waits trimErrorDelay before retrying.
-func RunChangelogTrimmer(ctx context.Context, writer *store.Writer, retention time.Duration) {
-	timer := time.NewTimer(trimInterval)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			n, err := TrimChangelog(ctx, writer, retention)
-			if err != nil {
-				slog.Error("trimmer: trim failed", "error", err)
-				timer.Reset(trimErrorDelay)
-			} else if n >= trimBatchSize {
-				slog.Info("trimmer: trimmed old entries (backlog)", "removed", n, "retention", retention)
-				timer.Reset(trimBacklogDelay)
-			} else {
-				if n > 0 {
-					slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
-				}
-				timer.Reset(trimInterval)
-			}
-		}
-	}
 }

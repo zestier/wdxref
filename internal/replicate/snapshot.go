@@ -155,6 +155,8 @@ func (g *SnapshotGenerator) isSnapshotCurrent() (*snapshotMeta, bool) {
 		return meta, false
 	}
 	if firstID == "" || compareStreamIDs(meta.ID, firstID) < 0 {
+		slog.Warn("snapshot: changelog has been trimmed past snapshot position; regenerating",
+			"snapshot_id", meta.ID, "first_changelog_id", firstID)
 		return meta, false
 	}
 	return meta, true

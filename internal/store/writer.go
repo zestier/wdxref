@@ -472,13 +472,13 @@ func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit in
 	return w.rdb.XTrimMinID(ctx, changelogKey, trimID).Result()
 }
 
-// claimScript atomically moves up to ARGV[1] random members from
-// KEYS[1] (pending) to KEYS[2] (processing) and returns them.
+// claimScript atomically pops up to ARGV[1] members from KEYS[1] (pending),
+// adds them to KEYS[2] (processing), and returns them.
 var claimScript = redis.NewScript(`
-local members = redis.call('SRANDMEMBER', KEYS[1], ARGV[1])
+local members = redis.call('SPOP', KEYS[1], ARGV[1])
 if #members == 0 then return {} end
 for _, m in ipairs(members) do
-  redis.call('SMOVE', KEYS[1], KEYS[2], m)
+  redis.call('SADD', KEYS[2], m)
 end
 return members
 `)

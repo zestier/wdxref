@@ -170,6 +170,12 @@ func compareStreamIDs(a, b string) int {
 // trimBatchSize is the number of entries removed per trim tick.
 const trimBatchSize = 1000
 
+// trimInterval is the base interval between trim ticks when the trimmer
+// is caught up. When a full batch is trimmed (indicating a backlog), the
+// next tick fires after trimBacklogDelay instead.
+const trimInterval = 1 * time.Minute
+const trimBacklogDelay = 1 * time.Second
+
 // TrimChangelog trims changelog entries older than the retention period,
 // removing up to trimBatchSize entries per call.
 func TrimChangelog(ctx context.Context, writer *store.Writer, retention time.Duration) (int64, error) {
@@ -178,21 +184,30 @@ func TrimChangelog(ctx context.Context, writer *store.Writer, retention time.Dur
 	return writer.StreamTrimOlderThan(ctx, minID, trimBatchSize)
 }
 
-// RunChangelogTrimmer periodically trims the changelog stream.
+// RunChangelogTrimmer periodically trims the changelog stream. It adapts
+// its tick rate: when a full batch is removed (backlog), the next tick
+// fires after trimBacklogDelay; otherwise it waits trimInterval.
 func RunChangelogTrimmer(ctx context.Context, writer *store.Writer, retention time.Duration) {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
+	timer := time.NewTimer(trimInterval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			n, err := TrimChangelog(ctx, writer, retention)
 			if err != nil {
 				slog.Error("trimmer: trim failed", "error", err)
-			} else if n > 0 {
-				slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
+				timer.Reset(trimInterval)
+			} else if n >= trimBatchSize {
+				slog.Info("trimmer: trimmed old entries (backlog)", "removed", n, "retention", retention)
+				timer.Reset(trimBacklogDelay)
+			} else {
+				if n > 0 {
+					slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
+				}
+				timer.Reset(trimInterval)
 			}
 		}
 	}

@@ -457,7 +457,7 @@ func (w *Writer) TrimChangelog() error {
 // millions of entries at once and OOM the server.
 // Returns the number of entries removed.
 func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit int64) (int64, error) {
-	old, err := w.rdb.XRangeN(ctx, changelogKey, "-", "("+minID, limit).Result()
+	old, err := w.rdb.XRangeN(ctx, changelogKey, "-", "("+minID, limit+1).Result()
 	if err != nil {
 		return 0, fmt.Errorf("xrange: %w", err)
 	}

@@ -451,9 +451,11 @@ func (w *Writer) TrimChangelog() error {
 }
 
 // StreamTrimOlderThan removes up to limit changelog entries with IDs strictly
-// less than minID. It uses XRANGE to count old entries and XTRIM MAXLEN to
-// remove them from the head, avoiding a single massive XTRIM MINID that could
-// OOM the server. Returns the number of entries removed.
+// less than minID. It uses XRANGE to find a bounded batch of old entries,
+// then XTRIM MINID to remove them from the head. This avoids passing a
+// far-in-the-past cutoff directly to XTRIM MINID, which could try to delete
+// millions of entries at once and OOM the server.
+// Returns the number of entries removed.
 func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit int64) (int64, error) {
 	old, err := w.rdb.XRangeN(ctx, changelogKey, "-", "("+minID, limit).Result()
 	if err != nil {
@@ -463,15 +465,11 @@ func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit in
 		return 0, nil
 	}
 
-	length, err := w.rdb.XLen(ctx, changelogKey).Result()
-	if err != nil {
-		return 0, fmt.Errorf("xlen: %w", err)
-	}
-	target := length - int64(len(old))
-	if target < 0 {
-		target = 0
-	}
-	return w.rdb.XTrimMaxLen(ctx, changelogKey, target).Result()
+	// Use the last returned entry's ID as the MINID cutoff. XTRIM MINID
+	// keeps entries with ID >= minID, so this entry itself survives and
+	// will be cleaned up on the next tick.
+	trimID := old[len(old)-1].ID
+	return w.rdb.XTrimMinID(ctx, changelogKey, trimID).Result()
 }
 
 // claimScript atomically moves up to ARGV[1] random members from

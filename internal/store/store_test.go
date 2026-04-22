@@ -1239,21 +1239,23 @@ func TestStreamTrim(t *testing.T) {
 		t.Fatalf("expected 3 events, got %d", len(all))
 	}
 
-	// Trim everything before the last event.
+	// Trim everything before the last event. The XRANGE finds 2 entries
+	// before all[2]; XTRIM MINID uses the last one's ID, so that entry
+	// survives until the next tick.
 	n, err := w.StreamTrimOlderThan(context.Background(), all[2].ID, 100)
 	if err != nil {
 		t.Fatalf("StreamTrimOlderThan: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("trimmed = %d, want 2", n)
+	if n != 1 {
+		t.Errorf("trimmed = %d, want 1", n)
 	}
 
 	_, _, length, err := r.StreamInfo()
 	if err != nil {
 		t.Fatalf("StreamInfo after trim: %v", err)
 	}
-	if length != 1 {
-		t.Errorf("length after trim = %d, want 1", length)
+	if length != 2 {
+		t.Errorf("length after trim = %d, want 2", length)
 	}
 }
 
@@ -1269,21 +1271,22 @@ func TestStreamTrimRespectsLimit(t *testing.T) {
 		t.Fatalf("expected 10 events, got %d", len(all))
 	}
 
-	// Trim with limit of 3 — should only remove 3 of the 7 old entries.
+	// Trim with limit of 3 — XRANGE returns 3 entries, XTRIM MINID uses
+	// the last one's ID so only 2 are removed. The 3rd survives until next tick.
 	n, err := w.StreamTrimOlderThan(context.Background(), all[7].ID, 3)
 	if err != nil {
 		t.Fatalf("StreamTrimOlderThan: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("trimmed = %d, want 3", n)
+	if n != 2 {
+		t.Errorf("trimmed = %d, want 2", n)
 	}
 
 	_, _, length, err := r.StreamInfo()
 	if err != nil {
 		t.Fatalf("StreamInfo: %v", err)
 	}
-	if length != 7 {
-		t.Errorf("length = %d, want 7", length)
+	if length != 8 {
+		t.Errorf("length = %d, want 8", length)
 	}
 }
 

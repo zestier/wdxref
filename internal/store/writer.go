@@ -437,6 +437,7 @@ const (
 // full batch is removed (backlog), the next tick fires quickly; otherwise
 // it waits trimInterval. On errors it backs off before retrying.
 func RunChangelogTrimmer(ctx context.Context, w *Writer, retention time.Duration) {
+	slog.Info("trimmer: starting", "retention", retention, "interval", trimInterval)
 	timer := time.NewTimer(trimInterval)
 	defer timer.Stop()
 

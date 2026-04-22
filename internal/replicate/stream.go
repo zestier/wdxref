@@ -175,6 +175,7 @@ const trimBatchSize = 1000
 // next tick fires after trimBacklogDelay instead.
 const trimInterval = 1 * time.Minute
 const trimBacklogDelay = 1 * time.Second
+const trimErrorDelay = 5 * time.Minute
 
 // TrimChangelog trims changelog entries older than the retention period,
 // removing up to trimBatchSize entries per call.
@@ -186,7 +187,8 @@ func TrimChangelog(ctx context.Context, writer *store.Writer, retention time.Dur
 
 // RunChangelogTrimmer periodically trims the changelog stream. It adapts
 // its tick rate: when a full batch is removed (backlog), the next tick
-// fires after trimBacklogDelay; otherwise it waits trimInterval.
+// fires after trimBacklogDelay; otherwise it waits trimInterval. On errors
+// it waits trimErrorDelay before retrying.
 func RunChangelogTrimmer(ctx context.Context, writer *store.Writer, retention time.Duration) {
 	timer := time.NewTimer(trimInterval)
 	defer timer.Stop()
@@ -199,7 +201,7 @@ func RunChangelogTrimmer(ctx context.Context, writer *store.Writer, retention ti
 			n, err := TrimChangelog(ctx, writer, retention)
 			if err != nil {
 				slog.Error("trimmer: trim failed", "error", err)
-				timer.Reset(trimInterval)
+				timer.Reset(trimErrorDelay)
 			} else if n >= trimBatchSize {
 				slog.Info("trimmer: trimmed old entries (backlog)", "removed", n, "retention", retention)
 				timer.Reset(trimBacklogDelay)

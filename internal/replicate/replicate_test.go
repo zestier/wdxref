@@ -27,7 +27,7 @@ import (
 func testSetup(t *testing.T) (*store.Writer, *store.Reader, *redis.Client, *miniredis.Miniredis) {
 	t.Helper()
 	s := miniredis.RunT(t)
-	c, err := store.NewClient(s.Addr())
+	c, err := store.NewTestClient(s.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestCheckStreamGap_StoreUnavailable(t *testing.T) {
 
 	// Create a reader pointed at the miniredis instance, then close it
 	// to simulate kvrocks being down.
-	c2, err := store.NewClient(ms.Addr())
+	c2, err := store.NewTestClient(ms.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestServeStream(t *testing.T) {
 
 	t.Run("503_when_store_unavailable", func(t *testing.T) {
 		_, _, _, ms2 := testSetup(t)
-		c2, err := store.NewClient(ms2.Addr())
+		c2, err := store.NewTestClient(ms2.Addr())
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
@@ -283,7 +283,7 @@ func TestServeStream(t *testing.T) {
 // the handler's blocking XRead.
 func TestServeStreamEvents(t *testing.T) {
 	ms := miniredis.RunT(t)
-	c, err := store.NewClient(ms.Addr())
+	c, err := store.NewTestClient(ms.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestServeStreamEvents(t *testing.T) {
 	// Close miniredis after a short delay so the blocking XRead fails
 	// and the handler returns after sending the initial events.
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		ms.Close()
 	}()
 
@@ -343,7 +343,7 @@ func TestServeStreamEvents(t *testing.T) {
 
 func TestServeStreamEvents_Zstd(t *testing.T) {
 	ms := miniredis.RunT(t)
-	c, err := store.NewClient(ms.Addr())
+	c, err := store.NewTestClient(ms.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestServeStreamEvents_Zstd(t *testing.T) {
 	defer server.Close()
 
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		ms.Close()
 	}()
 
@@ -419,7 +419,7 @@ func TestServeStreamEvents_Zstd(t *testing.T) {
 
 func TestServeStreamEvents_Gzip(t *testing.T) {
 	ms := miniredis.RunT(t)
-	c, err := store.NewClient(ms.Addr())
+	c, err := store.NewTestClient(ms.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestServeStreamEvents_Gzip(t *testing.T) {
 	defer server.Close()
 
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		ms.Close()
 	}()
 

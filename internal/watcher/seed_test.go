@@ -462,7 +462,7 @@ func TestProcessDumpStream_ReturnsBackgroundWriterError(t *testing.T) {
 	withDumpWriteRetryDelay(t, func(int) time.Duration { return time.Millisecond })
 
 	s := miniredis.RunT(t)
-	c, err := store.NewClient(s.Addr())
+	c, err := store.NewTestClient(s.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

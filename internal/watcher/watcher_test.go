@@ -758,7 +758,7 @@ func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
 
 func TestConnectAndProcess_EnqueueFailureReturnsError(t *testing.T) {
 	s := miniredis.RunT(t)
-	c, err := store.NewClient(s.Addr())
+	c, err := store.NewTestClient(s.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -817,7 +817,7 @@ func TestConnectAndProcess_EnqueueFailureReturnsError(t *testing.T) {
 
 func TestConnectAndProcess_FinalEnqueueFlushFailureReturnsError(t *testing.T) {
 	s := miniredis.RunT(t)
-	c, err := store.NewClient(s.Addr())
+	c, err := store.NewTestClient(s.Addr())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

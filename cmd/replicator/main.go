@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -93,8 +94,11 @@ func main() {
 	handler := replicate.Handler(reader, snapshot, encodings)
 
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      handler,
+		Addr:    addr,
+		Handler: handler,
+		BaseContext: func(_ net.Listener) context.Context {
+			return ctx
+		},
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0, // SSE streams have no write deadline
 		IdleTimeout:  120 * time.Second,

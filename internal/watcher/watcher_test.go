@@ -19,7 +19,8 @@ import (
 
 // buildTestEntityJSON constructs a bare Wikidata entity JSON object for
 // testing. Each property is given datatype "external-id" so extractExternalIDs
-// picks it up. Returns the entity object directly (no API wrapper).
+// picks it up. All claims default to rank "normal". Returns the entity
+// object directly (no API wrapper).
 func buildTestEntityJSON(qid, label string, properties map[string]string) []byte {
 	claims := make(map[string]interface{})
 	for propID, value := range properties {
@@ -32,6 +33,7 @@ func buildTestEntityJSON(qid, label string, properties map[string]string) []byte
 						"type":  "string",
 					},
 				},
+				"rank": "normal",
 			},
 		}
 	}
@@ -169,6 +171,184 @@ func TestExtractExternalIDs_NoClaims(t *testing.T) {
 	}
 	if len(result) != 0 {
 		t.Errorf("expected empty slice, got %v", result)
+	}
+}
+
+func TestExtractExternalIDs_RankOrdering(t *testing.T) {
+	// Build an entity with multiple claims per property at different ranks.
+	// P345 has preferred + normal; P100 has deprecated + normal.
+	// Expected order: P100 (numeric < P345), normal before deprecated;
+	// then P345, preferred before normal.
+	entity := map[string]interface{}{
+		"id": "Q1",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "normal-val", "type": "string"},
+					},
+					"rank": "normal",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "preferred-val", "type": "string"},
+					},
+					"rank": "preferred",
+				},
+			},
+			"P100": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "deprecated-val", "type": "string"},
+					},
+					"rank": "deprecated",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "normal-val", "type": "string"},
+					},
+					"rank": "normal",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+	parsed, err := ParseEntityJSON(data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+
+	want := []string{
+		"P100:normal-val",
+		"P100:deprecated-val",
+		"P345:preferred-val",
+		"P345:normal-val",
+	}
+	if !slices.Equal(parsed.Mappings, want) {
+		t.Errorf("rank ordering:\ngot  %v\nwant %v", parsed.Mappings, want)
+	}
+}
+
+func TestExtractExternalIDs_Dedup(t *testing.T) {
+	// Same property+value at two different ranks should be deduplicated.
+	// The sort places higher ranks first, so the dedup naturally keeps the
+	// highest-ranked occurrence.
+	entity := map[string]interface{}{
+		"id": "Q2",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt123", "type": "string"},
+					},
+					"rank": "preferred",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt123", "type": "string"},
+					},
+					"rank": "normal",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+	parsed, err := ParseEntityJSON(data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+
+	if len(parsed.Mappings) != 1 {
+		t.Fatalf("expected 1 mapping after dedup, got %d: %v", len(parsed.Mappings), parsed.Mappings)
+	}
+	if parsed.Mappings[0] != "P345:tt123" {
+		t.Errorf("got %q, want P345:tt123", parsed.Mappings[0])
+	}
+}
+
+func TestExtractExternalIDs_ValueSubsort(t *testing.T) {
+	// Multiple distinct values at the same rank for the same property should
+	// be sorted alphabetically, ensuring deterministic output regardless of
+	// JSON map iteration order.
+	entity := map[string]interface{}{
+		"id": "Q4",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt999", "type": "string"},
+					},
+					"rank": "normal",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt111", "type": "string"},
+					},
+					"rank": "normal",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt555", "type": "string"},
+					},
+					"rank": "normal",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+	parsed, err := ParseEntityJSON(data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+
+	want := []string{"P345:tt111", "P345:tt555", "P345:tt999"}
+	if !slices.Equal(parsed.Mappings, want) {
+		t.Errorf("value subsort:\ngot  %v\nwant %v", parsed.Mappings, want)
+	}
+}
+
+func TestExtractExternalIDs_MissingRank(t *testing.T) {
+	// Claims without a "rank" field should be treated as normal (rank 0).
+	// Older dumps or hand-crafted JSON may omit it entirely.
+	entity := map[string]interface{}{
+		"id": "Q3",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "no-rank", "type": "string"},
+					},
+					// rank field intentionally absent
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "preferred-val", "type": "string"},
+					},
+					"rank": "preferred",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+	parsed, err := ParseEntityJSON(data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+
+	want := []string{"P345:preferred-val", "P345:no-rank"}
+	if !slices.Equal(parsed.Mappings, want) {
+		t.Errorf("missing rank ordering:\ngot  %v\nwant %v", parsed.Mappings, want)
 	}
 }
 

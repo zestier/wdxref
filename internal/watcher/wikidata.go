@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -224,12 +225,36 @@ type claimsMap map[string][]struct {
 			Type  string          `json:"type"`
 		} `json:"datavalue"`
 	} `json:"mainsnak"`
+	Rank string `json:"rank"`
+}
+
+// rankOrder maps Wikidata claim ranks to sort priority.
+// Lower value = higher priority (preferred first, deprecated last).
+// Normal (the default rank) is zero.
+func rankOrder(rank string) int {
+	switch rank {
+	case "preferred":
+		return -1
+	case "normal", "":
+		return 0
+	case "deprecated":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // extractExternalIDs collects all claims with datatype "external-id"
-// and returns them as a flat array of "P<id>:<value>" strings.
+// and returns them as a deduplicated flat array of "P<id>:<value>" strings,
+// sorted by property key, then rank (preferred > normal > deprecated),
+// then value.
 func extractExternalIDs(claims claimsMap) []string {
-	entries := []string{}
+	type entry struct {
+		propKey string // map key reference, no allocation
+		rank    int
+		value   string
+	}
+	entries := make([]entry, 0, len(claims))
 	for propKey, propClaims := range claims {
 		if len(propKey) < 2 || propKey[0] != 'P' {
 			continue
@@ -243,11 +268,34 @@ func extractExternalIDs(claims claimsMap) []string {
 			}
 			value := extractStringValue(claim.MainSnak.DataValue.Value)
 			if value != "" {
-				entries = append(entries, propKey+":"+value)
+				entries = append(entries, entry{
+					propKey: propKey,
+					rank:    rankOrder(claim.Rank),
+					value:   value,
+				})
 			}
 		}
 	}
-	return entries
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].propKey != entries[j].propKey {
+			return entries[i].propKey < entries[j].propKey
+		}
+		if entries[i].rank != entries[j].rank {
+			return entries[i].rank < entries[j].rank
+		}
+		return entries[i].value < entries[j].value
+	})
+	// Duplicates (same propKey + value, different rank) are adjacent after
+	// sorting, so dedup is a simple look-back. String concatenation is
+	// deferred to here so only surviving entries allocate.
+	result := make([]string, 0, len(entries))
+	for i, e := range entries {
+		if i > 0 && entries[i-1].propKey == e.propKey && entries[i-1].value == e.value {
+			continue
+		}
+		result = append(result, e.propKey+":"+e.value)
+	}
+	return result
 }
 
 // extractStringValue extracts a string value from a Wikidata datavalue.

@@ -100,6 +100,7 @@ func withStaticDumpLocator(seeder *Seeder, url, date string) {
 // buildDumpEntityJSON constructs a Wikidata dump-format entity JSON line.
 // This is the bare entity format (no {"entities":{...}} wrapper).
 // Each property is given datatype "external-id" so extractExternalIDs picks it up.
+// All claims default to rank "normal".
 func buildDumpEntityJSON(qid, label string, properties map[string]string) []byte {
 	claims := make(map[string]interface{})
 	for propID, value := range properties {
@@ -114,6 +115,7 @@ func buildDumpEntityJSON(qid, label string, properties map[string]string) []byte
 						"type":  "string",
 					},
 				},
+				"rank": "normal",
 			},
 		}
 	}
@@ -232,6 +234,71 @@ func TestParseEntityJSON_DumpInvalidJSON(t *testing.T) {
 	_, err := ParseEntityJSON([]byte(`{invalid json`))
 	if err == nil {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestRankOrder_RoundTrip(t *testing.T) {
+	// Verify that rank-ordered mappings survive the full
+	// parse → store → lookup cycle with order preserved.
+	w, r := newTestStoreWriter(t)
+
+	// Build entity JSON with multiple claims per property at different ranks.
+	entity := map[string]interface{}{
+		"type": "item",
+		"id":   "Q99",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt-normal", "type": "string"},
+					},
+					"rank": "normal",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt-preferred", "type": "string"},
+					},
+					"rank": "preferred",
+				},
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "tt-deprecated", "type": "string"},
+					},
+					"rank": "deprecated",
+				},
+			},
+			"P100": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"datatype":  "external-id",
+						"datavalue": map[string]interface{}{"value": "abc", "type": "string"},
+					},
+					"rank": "normal",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+
+	parsed, err := ParseEntityJSON(data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+
+	// Store and read back.
+	testWriterUpsertEntity(t, w, parsed.ID, parsed.Mappings)
+	result := lookupFirst(t, r, 345, "tt-preferred")
+	if result == nil {
+		t.Fatal("expected lookup result")
+	}
+
+	// Stored order must match parser output exactly.
+	want := []string{"P100:abc", "P345:tt-preferred", "P345:tt-normal", "P345:tt-deprecated"}
+	if !slices.Equal(result.Mappings, want) {
+		t.Errorf("round-trip order:\ngot  %v\nwant %v", result.Mappings, want)
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,25 +98,21 @@ end
 
 local new_parsed = cjson.decode(new_m)
 
--- Diff old and new sorted arrays via merge-walk.
+-- Diff old and new arrays via set difference.
 if is_new then
   for _, entry in ipairs(new_parsed) do add_idx(entry) end
 else
   local old_parsed = cjson.decode(old_m)
-  local i, j = 1, 1
-  local ol, nl = #old_parsed, #new_parsed
-  while i <= ol and j <= nl do
-    local o, n = old_parsed[i], new_parsed[j]
-    if o == n then
-      i = i + 1; j = j + 1
-    elseif o < n then
-      del_idx(o); i = i + 1
-    else
-      add_idx(n); j = j + 1
-    end
+  local old_set = {}
+  for _, e in ipairs(old_parsed) do old_set[e] = true end
+  local new_set = {}
+  for _, e in ipairs(new_parsed) do new_set[e] = true end
+  for _, e in ipairs(old_parsed) do
+    if not new_set[e] then del_idx(e) end
   end
-  while i <= ol do del_idx(old_parsed[i]); i = i + 1 end
-  while j <= nl do add_idx(new_parsed[j]); j = j + 1 end
+  for _, e in ipairs(new_parsed) do
+    if not old_set[e] then add_idx(e) end
+  end
 end
 
 if ARGV[3] ~= '1' then
@@ -538,16 +533,15 @@ func propKey(property int) string {
 }
 
 // canonicalMappingsJSON produces a deterministic JSON encoding of mappings
-// as a flat sorted array of "P<id>:<value>" strings (e.g. ["P345:tt0111161"])
-// so that byte-level string comparison in Lua detects no-ops reliably.
+// as a flat array of "P<id>:<value>" strings (e.g. ["P345:tt0111161"]).
+// The input is expected to already be in canonical order (sorted by numeric
+// property, rank, then value) as produced by extractExternalIDs.
+// Byte-level string comparison in Lua detects no-ops reliably.
 func canonicalMappingsJSON(entries []string) string {
 	if len(entries) == 0 {
 		return "[]"
 	}
-	sorted := make([]string, len(entries))
-	copy(sorted, entries)
-	sort.Strings(sorted)
-	data, _ := json.Marshal(sorted)
+	data, _ := json.Marshal(entries)
 	return string(data)
 }
 

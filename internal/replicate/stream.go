@@ -167,16 +167,20 @@ func compareStreamIDs(a, b string) int {
 	return 0
 }
 
-// TrimChangelog trims changelog entries older than the retention period.
-func TrimChangelog(reader *store.Reader, retention time.Duration) error {
+// trimBatchSize is the number of entries removed per trim tick.
+const trimBatchSize = 1000
+
+// TrimChangelog trims changelog entries older than the retention period,
+// removing up to trimBatchSize entries per call.
+func TrimChangelog(ctx context.Context, writer *store.Writer, retention time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-retention)
 	minID := fmt.Sprintf("%d-0", cutoff.UnixMilli())
-	return reader.StreamTrim(minID)
+	return writer.StreamTrimOlderThan(ctx, minID, trimBatchSize)
 }
 
 // RunChangelogTrimmer periodically trims the changelog stream.
-func RunChangelogTrimmer(ctx context.Context, reader *store.Reader, retention time.Duration) {
-	ticker := time.NewTicker(1 * time.Hour)
+func RunChangelogTrimmer(ctx context.Context, writer *store.Writer, retention time.Duration) {
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -184,10 +188,11 @@ func RunChangelogTrimmer(ctx context.Context, reader *store.Reader, retention ti
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := TrimChangelog(reader, retention); err != nil {
+			n, err := TrimChangelog(ctx, writer, retention)
+			if err != nil {
 				slog.Error("trimmer: trim failed", "error", err)
-			} else {
-				slog.Info("trimmer: trimmed old entries", "retention", retention)
+			} else if n > 0 {
+				slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
 			}
 		}
 	}

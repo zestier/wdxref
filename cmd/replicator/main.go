@@ -69,6 +69,7 @@ func main() {
 	defer client.Close()
 
 	reader := store.NewReader(client)
+	writer := store.NewWriter(client)
 
 	// Ensure snapshot directory exists.
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
@@ -85,7 +86,7 @@ func main() {
 	go snapshot.Run(ctx)
 
 	// Run changelog trimmer in background.
-	go replicate.RunChangelogTrimmer(ctx, reader, changelogRetention)
+	go replicate.RunChangelogTrimmer(ctx, writer, changelogRetention)
 
 	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
 

@@ -1240,8 +1240,12 @@ func TestStreamTrim(t *testing.T) {
 	}
 
 	// Trim everything before the last event.
-	if err := r.StreamTrim(all[2].ID); err != nil {
-		t.Fatalf("StreamTrim: %v", err)
+	n, err := w.StreamTrimOlderThan(context.Background(), all[2].ID, 100)
+	if err != nil {
+		t.Fatalf("StreamTrimOlderThan: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("trimmed = %d, want 2", n)
 	}
 
 	_, _, length, err := r.StreamInfo()
@@ -1250,6 +1254,76 @@ func TestStreamTrim(t *testing.T) {
 	}
 	if length != 1 {
 		t.Errorf("length after trim = %d, want 1", length)
+	}
+}
+
+func TestStreamTrimRespectsLimit(t *testing.T) {
+	w, r := newTestSetup(t)
+
+	for i := 1; i <= 10; i++ {
+		testUpsertEntity(t, w, fmt.Sprintf("Q%d", i), []string{fmt.Sprintf("P345:tt%d", i)})
+	}
+
+	all, _ := r.StreamRead(context.Background(), "0", 20, 0)
+	if len(all) != 10 {
+		t.Fatalf("expected 10 events, got %d", len(all))
+	}
+
+	// Trim with limit of 3 — should only remove 3 of the 7 old entries.
+	n, err := w.StreamTrimOlderThan(context.Background(), all[7].ID, 3)
+	if err != nil {
+		t.Fatalf("StreamTrimOlderThan: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("trimmed = %d, want 3", n)
+	}
+
+	_, _, length, err := r.StreamInfo()
+	if err != nil {
+		t.Fatalf("StreamInfo: %v", err)
+	}
+	if length != 7 {
+		t.Errorf("length = %d, want 7", length)
+	}
+}
+
+func TestStreamTrimNothingToTrim(t *testing.T) {
+	w, r := newTestSetup(t)
+
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+
+	all, _ := r.StreamRead(context.Background(), "0", 10, 0)
+	if len(all) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(all))
+	}
+
+	// Trim with the only entry's ID — nothing should be removed.
+	n, err := w.StreamTrimOlderThan(context.Background(), all[0].ID, 100)
+	if err != nil {
+		t.Fatalf("StreamTrimOlderThan: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("trimmed = %d, want 0", n)
+	}
+
+	_, _, length, err := r.StreamInfo()
+	if err != nil {
+		t.Fatalf("StreamInfo: %v", err)
+	}
+	if length != 1 {
+		t.Errorf("length = %d, want 1", length)
+	}
+}
+
+func TestStreamTrimEmptyStream(t *testing.T) {
+	w, _ := newTestSetup(t)
+
+	n, err := w.StreamTrimOlderThan(context.Background(), "99999999999-0", 100)
+	if err != nil {
+		t.Fatalf("StreamTrimOlderThan: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("trimmed = %d, want 0", n)
 	}
 }
 

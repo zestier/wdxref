@@ -450,6 +450,30 @@ func (w *Writer) TrimChangelog() error {
 	return w.rdb.Del(ctx, changelogKey).Err()
 }
 
+// StreamTrimOlderThan removes up to limit changelog entries with IDs strictly
+// less than minID. It uses XRANGE to count old entries and XTRIM MAXLEN to
+// remove them from the head, avoiding a single massive XTRIM MINID that could
+// OOM the server. Returns the number of entries removed.
+func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit int64) (int64, error) {
+	old, err := w.rdb.XRangeN(ctx, changelogKey, "-", "("+minID, limit).Result()
+	if err != nil {
+		return 0, fmt.Errorf("xrange: %w", err)
+	}
+	if len(old) == 0 {
+		return 0, nil
+	}
+
+	length, err := w.rdb.XLen(ctx, changelogKey).Result()
+	if err != nil {
+		return 0, fmt.Errorf("xlen: %w", err)
+	}
+	target := length - int64(len(old))
+	if target < 0 {
+		target = 0
+	}
+	return w.rdb.XTrimMaxLen(ctx, changelogKey, target).Result()
+}
+
 // claimScript atomically moves up to ARGV[1] random members from
 // KEYS[1] (pending) to KEYS[2] (processing) and returns them.
 var claimScript = redis.NewScript(`

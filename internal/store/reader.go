@@ -416,11 +416,6 @@ func (r *Reader) StreamInfo() (firstID, lastID string, length int64, err error) 
 	return firstID, lastID, info.Length, nil
 }
 
-// StreamTrim removes changelog entries older than minID.
-func (r *Reader) StreamTrim(minID string) error {
-	return r.rdb.XTrimMinID(context.Background(), changelogKey, minID).Err()
-}
-
 // Close is a no-op for Reader; the underlying Client manages the connection.
 func (r *Reader) Close() error {
 	return nil

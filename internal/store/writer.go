@@ -426,9 +426,20 @@ const (
 	// DefaultChangelogRetention is how long changelog entries are kept.
 	DefaultChangelogRetention = 168 * time.Hour // 7 days
 
-	trimBatchSize    = 1000
-	trimInterval     = 1 * time.Minute
-	trimBacklogDelay = 1 * time.Second
+	// trimBatchSize bounds a single XRANGE+XTRIM cycle. It must be large
+	// enough that the trimmer can keep up with seed-time write rates (the
+	// seed upsert path XADDs to the changelog for every entity, typically
+	// well over 1k/s), but small enough that the XRANGE response and per-
+	// call XTRIM work stay modest. Entries are small (QID + mappings JSON),
+	// so 10k per cycle is a few MB on the wire.
+	trimBatchSize = 10000
+	trimInterval  = 1 * time.Minute
+	// trimBacklogDelay is a short yield between cycles while a backlog is
+	// being drained. It exists only to keep the select loop responsive to
+	// ctx.Done(); we do not want to rate-limit draining itself, since the
+	// write side (especially during seeding with CHANGELOG_RETENTION=0)
+	// can easily outpace a once-per-second trimmer.
+	trimBacklogDelay = 10 * time.Millisecond
 	trimErrorDelay   = 5 * time.Minute
 )
 

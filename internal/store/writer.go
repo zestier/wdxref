@@ -433,7 +433,7 @@ const (
 	// call XTRIM work stay modest. Entries are small (QID + mappings JSON),
 	// so 10k per cycle is a few MB on the wire.
 	trimBatchSize = 10000
-	trimInterval  = 1 * time.Minute
+	trimInterval  = 5 * time.Minute
 	// trimBacklogDelay is a short yield between cycles while a backlog is
 	// being drained. It exists only to keep the select loop responsive to
 	// ctx.Done(); we do not want to rate-limit draining itself, since the
@@ -449,7 +449,7 @@ const (
 // it waits trimInterval. On errors it backs off before retrying.
 func RunChangelogTrimmer(ctx context.Context, w *Writer, retention time.Duration) {
 	slog.Info("trimmer: starting", "retention", retention, "interval", trimInterval)
-	timer := time.NewTimer(trimInterval)
+	timer := time.NewTimer(0) // fire immediately on start
 	defer timer.Stop()
 
 	for {

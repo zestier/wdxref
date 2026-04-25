@@ -216,14 +216,13 @@ func ParseSnapshotDone(line []byte) (SnapshotDone, error) {
 }
 
 // FormatStreamChangeData formats a compact change payload for SSE data lines.
-// The wire format is "<id> <qid> [<raw-mappings-json>]".
+// The wire format is "<qid> [<raw-mappings-json>]". The stream ID is carried
+// separately in the SSE `id:` field (per the EventSource spec).
 // Presence of mappings means upsert; absence means delete.
-func FormatStreamChangeData(id string, qid int64, rawMappings string) string {
+func FormatStreamChangeData(qid int64, rawMappings string) string {
 	qidStr := strconv.FormatInt(qid, 10)
 	var builder strings.Builder
-	builder.Grow(len(id) + len(qidStr) + len(rawMappings) + 2)
-	builder.WriteString(id)
-	builder.WriteByte(' ')
+	builder.Grow(len(qidStr) + len(rawMappings) + 1)
 	builder.WriteString(qidStr)
 	if rawMappings != "" {
 		builder.WriteByte(' ')
@@ -233,22 +232,22 @@ func FormatStreamChangeData(id string, qid int64, rawMappings string) string {
 }
 
 // ParseStreamChangeData parses a compact change payload from an SSE data line.
-// Presence of mappings means upsert; absence means delete.
-func ParseStreamChangeData(data string) (id string, qid int64, rawMappings string, err error) {
-	first := strings.IndexByte(data, ' ')
-	if first <= 0 || first == len(data)-1 {
+// The wire format is "<qid> [<raw-mappings-json>]". Presence of mappings means
+// upsert; absence means delete.
+func ParseStreamChangeData(data string) (qid int64, rawMappings string, err error) {
+	if data == "" {
 		err = fmt.Errorf("invalid change event")
 		return
 	}
 
-	id = data[:first]
-	rest := data[first+1:]
-
-	sep := strings.IndexByte(rest, ' ')
-	qidPart := rest
-	if sep >= 0 {
-		qidPart = rest[:sep]
-		rawMappings = rest[sep+1:]
+	qidPart := data
+	if sep := strings.IndexByte(data, ' '); sep >= 0 {
+		if sep == 0 || sep == len(data)-1 {
+			err = fmt.Errorf("invalid change event")
+			return
+		}
+		qidPart = data[:sep]
+		rawMappings = data[sep+1:]
 	}
 
 	qid, err = strconv.ParseInt(qidPart, 10, 64)

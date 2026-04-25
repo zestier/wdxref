@@ -326,8 +326,8 @@ func TestServeStreamEvents(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
 	}
 
 	body, _ := io.ReadAll(resp.Body)

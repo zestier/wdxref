@@ -404,9 +404,9 @@ func TestConnectStream_UpsertEvents(t *testing.T) {
 	c, s, _ := newTestClient(t)
 
 	sseBody := fmt.Sprintf(
-		"event: change\ndata: %s\n\nevent: change\ndata: %s\n\n",
-		replicate.FormatStreamChangeData("100-0", 10, `{"213":["v1"]}`),
-		replicate.FormatStreamChangeData("101-0", 20, `{"214":["v2"]}`),
+		"id: 100-0\nevent: change\ndata: %s\n\nid: 101-0\nevent: change\ndata: %s\n\n",
+		replicate.FormatStreamChangeData(10, `{"213":["v1"]}`),
+		replicate.FormatStreamChangeData(20, `{"214":["v2"]}`),
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -582,8 +582,8 @@ func TestConnectStream_Zstd(t *testing.T) {
 	c, s, _ := newTestClient(t)
 
 	sseBody := fmt.Sprintf(
-		"event: change\ndata: %s\n\n",
-		replicate.FormatStreamChangeData("100-0", 10, `{"213":["v1"]}`),
+		"id: 100-0\nevent: change\ndata: %s\n\n",
+		replicate.FormatStreamChangeData(10, `{"213":["v1"]}`),
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -625,8 +625,8 @@ func TestConnectStream_Gzip(t *testing.T) {
 	c, s, _ := newTestClient(t)
 
 	sseBody := fmt.Sprintf(
-		"event: change\ndata: %s\n\n",
-		replicate.FormatStreamChangeData("100-0", 10, `{"213":["v1"]}`),
+		"id: 100-0\nevent: change\ndata: %s\n\n",
+		replicate.FormatStreamChangeData(10, `{"213":["v1"]}`),
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

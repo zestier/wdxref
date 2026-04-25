@@ -358,12 +358,35 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	var eventType string
+	var eventType, eventID string
 	for scanner.Scan() {
 		line := scanner.Text()
 
+		if line == "" {
+			// End of event — clear per-event fields. (eventID persists
+			// per the EventSource spec until explicitly overridden.)
+			eventType = ""
+			continue
+		}
+
+		if strings.HasPrefix(line, ":") {
+			// Comment line (e.g. ": keepalive"). Ignore.
+			continue
+		}
+
 		if strings.HasPrefix(line, "event: ") {
 			eventType = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+
+		if strings.HasPrefix(line, "id: ") {
+			eventID = strings.TrimPrefix(line, "id: ")
+			continue
+		}
+
+		if strings.HasPrefix(line, "retry: ") {
+			// Server-suggested reconnect delay; we manage retries
+			// ourselves, so just ignore.
 			continue
 		}
 
@@ -398,7 +421,11 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 				return nil
 
 			case "change":
-				id, qid, rawMappings, err := replicate.ParseStreamChangeData(data)
+				if eventID == "" {
+					slog.Warn("replica: skip change event missing id")
+					continue
+				}
+				qid, rawMappings, err := replicate.ParseStreamChangeData(data)
 				if err != nil {
 					slog.Warn("replica: skip malformed event", "error", err)
 					continue
@@ -414,16 +441,12 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 				} else {
 					p.DeleteEntity(qidStr)
 				}
-				p.SetSyncState("last_replicated_id", id)
+				p.SetSyncState("last_replicated_id", eventID)
 				if err := p.Exec(); err != nil {
-					return fmt.Errorf("apply change %s: %w", id, err)
+					return fmt.Errorf("apply change %s: %w", eventID, err)
 				}
 			}
-
-			eventType = ""
-			continue
 		}
-		// Ignore keepalive comments and empty lines.
 	}
 
 	if err := scanner.Err(); err != nil {

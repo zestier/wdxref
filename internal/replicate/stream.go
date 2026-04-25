@@ -14,16 +14,50 @@ import (
 	"github.com/ekeid/ekeid/internal/store"
 )
 
-// ServeStream handles GET /replicate/stream?since={id} as an SSE endpoint.
-// It replays changelog entries after `since` and then blocks for live changes.
-// If coverage for `since` cannot be proven (no retained entries, or `since`
-// older than the oldest retained entry), it sends an "event: reset" and
-// closes the connection.
-func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
-	since := r.URL.Query().Get("since")
-	if since == "" {
-		since = "0"
+// ClientReconnectDelay is sent to clients via the SSE `retry:` field as a
+// hint for how long to wait before reconnecting after the connection drops.
+const ClientReconnectDelay = 3 * time.Second
+
+// writeSSEHeaders writes the response headers expected by EventSource clients
+// and SSE-aware proxies. It must be called before WriteHeader.
+func writeSSEHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Connection", "keep-alive")
+	// Hint to nginx and other reverse proxies to disable response
+	// buffering so events are flushed to the client immediately.
+	h.Set("X-Accel-Buffering", "no")
+	// Permit cross-origin EventSource consumers (mirrors Wikimedia
+	// EventStreams behavior).
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Vary", "Accept-Encoding")
+}
+
+// resolveStreamCursor returns the stream cursor for this request, honoring
+// the `since` query parameter first and falling back to the standard
+// `Last-Event-ID` request header (used by browser EventSource on reconnect).
+// When neither is provided, "0" is returned, which forces a reset.
+func resolveStreamCursor(r *http.Request) string {
+	if since := r.URL.Query().Get("since"); since != "" {
+		return since
 	}
+	if last := r.Header.Get("Last-Event-ID"); last != "" {
+		return last
+	}
+	return "0"
+}
+
+// ServeStream handles GET /replicate/stream as an SSE endpoint compatible
+// with the W3C EventSource specification. The client identifies its current
+// position via either the `since` query parameter or the standard
+// `Last-Event-ID` request header (set automatically by EventSource on
+// reconnect). It replays changelog entries after that position and then
+// blocks for live changes. If coverage cannot be proven (no retained
+// entries, or position older than the oldest retained entry), it sends an
+// "event: reset" and closes the connection.
+func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
+	since := resolveStreamCursor(r)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -42,9 +76,7 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
+		writeSSEHeaders(w)
 		w.WriteHeader(http.StatusOK)
 
 		resetData := map[string]string{"reason": err.Error()}
@@ -52,15 +84,18 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 			resetData["state"] = stats.State
 		}
 		resetJSON, _ := json.Marshal(resetData)
+		fmt.Fprintf(w, "retry: %d\n", ClientReconnectDelay.Milliseconds())
 		fmt.Fprintf(w, "event: reset\ndata: %s\n\n", resetJSON)
 		flusher.Flush()
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	writeSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
+
+	// Initial preamble: a comment to flush headers immediately so clients
+	// know the connection is live, plus the reconnect-delay hint.
+	fmt.Fprintf(w, ": connected\nretry: %d\n\n", ClientReconnectDelay.Milliseconds())
 	flusher.Flush()
 
 	ctx := r.Context()
@@ -94,7 +129,9 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, ev := range events {
-			fmt.Fprintf(w, "event: change\ndata: %s\n\n", FormatStreamChangeData(ev.ID, ev.QID, ev.RawMappings))
+			// Emit the standard SSE `id:` field so EventSource clients
+			// resume automatically via Last-Event-ID after a disconnect.
+			fmt.Fprintf(w, "id: %s\nevent: change\ndata: %s\n\n", ev.ID, FormatStreamChangeData(ev.QID, ev.RawMappings))
 			cursor = ev.ID
 		}
 		flusher.Flush()

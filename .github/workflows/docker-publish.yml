@@ -2,7 +2,7 @@ name: Build and Publish Docker Images
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -20,7 +20,7 @@ jobs:
 
     strategy:
       matrix:
-        target: [api, watcher]
+        target: [api, primary, replicator, replica]
 
     steps:
       - name: Checkout

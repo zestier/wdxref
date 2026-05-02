@@ -1,0 +1,46 @@
+services:
+  kvrocks:
+    image: docker.io/apache/kvrocks:2.11.0
+    command: ["--dir", "/data/kvrocks", "--rocksdb.compression", "zstd"]
+    restart: unless-stopped
+    volumes:
+      - kvrocks-data:/data/kvrocks
+    ports:
+      - "6666:6666"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6666", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  primary:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: primary
+    restart: unless-stopped
+    depends_on:
+      kvrocks:
+        condition: service_healthy
+    environment:
+      - KVROCKS_ADDR=kvrocks:6666
+      - DUMP_FORMAT=bz2
+      - CONTACT=${CONTACT:?Set CONTACT to a URL or email for Wikimedia User-Agent policy}
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    depends_on:
+      kvrocks:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - KVROCKS_ADDR=kvrocks:6666
+      - LISTEN_ADDR=:8080
+
+volumes:
+  kvrocks-data:

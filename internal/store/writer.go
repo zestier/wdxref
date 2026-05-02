@@ -1,558 +1,624 @@
 package store
 
 import (
-	"database/sql"
+	"context"
+	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/redis/go-redis/v9"
 )
 
-// Writer provides read-write access to the database (used by the watcher).
+const (
+	changelogKey  = "changelog"
+	entitiesKey   = "entities"
+	metaKey       = "meta"
+	pendingKey    = "pending"
+	processingKey = "processing"
+	failedZsetKey = "failed_zset"
+)
+
+// Writer provides read-write access to Kvrocks (used by the primary and replica).
 type Writer struct {
-	db *sql.DB
+	rdb           *redis.Client
+	scriptsMu     sync.Mutex
+	scriptsLoaded atomic.Bool
 }
 
-// NewWriter opens a SQLite database in read-write mode and initializes the schema.
-func NewWriter(dbPath string) (*Writer, error) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
+// Lua scripts executed atomically on the server.
+//
+// upsertScript: KEYS = [changelog], ARGV = [new_m, eid]
+//
+//	Reads old entity from the "entities" hash, compares mappings string.
+//	If unchanged, returns 0. If changed, rewrites indexes, appends to the
+//	changelog, and updates counters.
+//	Mappings are stored as a flat JSON array of "P<id>:<value>" strings.
+var upsertScript = redis.NewScript(`
+local old_m = redis.call('HGET', 'entities', ARGV[2])
+local new_m = ARGV[1]
+local eid   = ARGV[2]
 
-	if err := configureSQLite(db); err != nil {
-		db.Close()
-		return nil, err
-	}
+local is_new = not old_m
+local changed = is_new or (old_m ~= new_m)
 
-	if err := createSchema(db); err != nil {
-		db.Close()
-		return nil, err
-	}
+if not changed then
+  return 0
+end
 
-	return &Writer{db: db}, nil
+redis.call('HSET', 'entities', eid, new_m)
+
+-- Parse a "P<id>:<value>" entry into the property key and value.
+local function parse(e)
+  local colon = string.find(e, ':', 2)
+  return 'p:' .. string.sub(e, 2, colon - 1), string.sub(e, colon + 1)
+end
+
+-- Insert eid into a comma-separated sorted list stored at hash key pk, field val.
+local function add_idx(e)
+  local pk, val = parse(e)
+  local cur = redis.call('HGET', pk, val)
+  if not cur then
+    redis.call('HSET', pk, val, eid)
+    return
+  end
+  local parts = {}
+  local found = false
+  for s in string.gmatch(cur, '[^,]+') do
+    if s == eid then found = true end
+    parts[#parts + 1] = s
+  end
+  if found then return end
+  parts[#parts + 1] = eid
+  table.sort(parts)
+  redis.call('HSET', pk, val, table.concat(parts, ','))
+end
+
+-- Remove eid from a comma-separated sorted list stored at hash key pk, field val.
+local function del_idx(e)
+  local pk, val = parse(e)
+  local cur = redis.call('HGET', pk, val)
+  if not cur then return end
+  local parts = {}
+  for s in string.gmatch(cur, '[^,]+') do
+    if s ~= eid then parts[#parts + 1] = s end
+  end
+  if #parts == 0 then
+    redis.call('HDEL', pk, val)
+  else
+    redis.call('HSET', pk, val, table.concat(parts, ','))
+  end
+end
+
+local new_parsed = cjson.decode(new_m)
+
+-- Diff old and new arrays via set difference.
+if is_new then
+  for _, entry in ipairs(new_parsed) do add_idx(entry) end
+else
+  local old_parsed = cjson.decode(old_m)
+  local old_set = {}
+  for _, e in ipairs(old_parsed) do old_set[e] = true end
+  local new_set = {}
+  for _, e in ipairs(new_parsed) do new_set[e] = true end
+  for _, e in ipairs(old_parsed) do
+    if not new_set[e] then del_idx(e) end
+  end
+  for _, e in ipairs(new_parsed) do
+    if not old_set[e] then add_idx(e) end
+  end
+end
+
+redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', new_m)
+
+if is_new then
+  redis.call('HINCRBY', 'meta', 'entity_count', 1)
+end
+
+return 1
+`)
+
+// deleteScript: KEYS = [changelog], ARGV = [eid]
+//
+//	Reads entity from the "entities" hash, removes indexes, appends
+//	delete to changelog, updates counters. Returns 0 if entity was
+//	already gone.
+var deleteScript = redis.NewScript(`
+local eid = ARGV[1]
+local old_m = redis.call('HGET', 'entities', eid)
+if not old_m then return 0 end
+
+redis.call('HDEL', 'entities', eid)
+
+local old = cjson.decode(old_m)
+for _, entry in ipairs(old) do
+  local colon = string.find(entry, ':', 2)
+  local prop = string.sub(entry, 2, colon - 1)
+  local val  = string.sub(entry, colon + 1)
+  local pk = 'p:' .. prop
+  local cur = redis.call('HGET', pk, val)
+  if cur then
+    local parts = {}
+    for s in string.gmatch(cur, '[^,]+') do
+      if s ~= eid then parts[#parts + 1] = s end
+    end
+    if #parts == 0 then
+      redis.call('HDEL', pk, val)
+    else
+      redis.call('HSET', pk, val, table.concat(parts, ','))
+    end
+  end
+end
+
+redis.call('XADD', KEYS[1], '*', 'q', eid, 'm', '')
+
+redis.call('HINCRBY', 'meta', 'entity_count', -1)
+
+return 1
+`)
+
+// NewWriter creates a Writer that connects to Kvrocks via the given Client.
+func NewWriter(c *Client) *Writer {
+	return &Writer{rdb: c.Redis()}
 }
 
-func configureSQLite(db *sql.DB) error {
-	// SQLite only allows one writer at a time. Limiting Go's connection pool
-	// to a single connection prevents "database is locked" errors when
-	// multiple goroutines write concurrently.
-	db.SetMaxOpenConns(1)
-
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
+// loadScripts ensures all Lua scripts are loaded into the server cache.
+// This is necessary before using scripts in pipelines, which cannot
+// fallback from EVALSHA to EVAL automatically.
+// Scripts are loaded once and retried on subsequent calls if loading fails.
+func (w *Writer) loadScripts(ctx context.Context) error {
+	if w.scriptsLoaded.Load() {
+		return nil
 	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return fmt.Errorf("exec %q: %w", p, err)
+	w.scriptsMu.Lock()
+	defer w.scriptsMu.Unlock()
+	if w.scriptsLoaded.Load() {
+		return nil
+	}
+	for _, s := range []*redis.Script{upsertScript, deleteScript, recordFailedScript} {
+		if err := s.Load(ctx, w.rdb).Err(); err != nil {
+			return fmt.Errorf("load lua script: %w", err)
 		}
 	}
+	w.scriptsLoaded.Store(true)
 	return nil
-}
-
-func createSchema(db *sql.DB) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS entity (
-		wikidata_id INTEGER PRIMARY KEY,
-		viewed_at   INTEGER NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS mapping (
-		property    INTEGER NOT NULL,
-		value       TEXT NOT NULL,
-		wikidata_id INTEGER NOT NULL REFERENCES entity(wikidata_id) ON DELETE CASCADE,
-		PRIMARY KEY (property, value)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_mapping_wikidata ON mapping(wikidata_id);
-
-	CREATE TABLE IF NOT EXISTS sync_state (
-		key   TEXT PRIMARY KEY,
-		value TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS failed_entity (
-		wikidata_id     INTEGER PRIMARY KEY,
-		error           TEXT NOT NULL,
-		attempts        INTEGER NOT NULL DEFAULT 1,
-		first_failed_at TEXT NOT NULL,
-		last_failed_at  TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS pending_entity (
-		wikidata_id INTEGER PRIMARY KEY
-	);`
-	_, err := db.Exec(schema)
-	if err != nil {
-		return fmt.Errorf("create schema: %w", err)
-	}
-	return nil
-}
-
-// MigrateSchema checks the stored schema version and drops all tables if it
-// does not match the current SchemaVersion(). This ensures the database
-// structure is always consistent with the running code. After dropping,
-// tables are recreated and the new version is stored.
-func (w *Writer) MigrateSchema() error {
-	expected := SchemaVersion()
-
-	// Try to read the stored version. If sync_state doesn't exist yet
-	// (brand-new DB) the query will fail — treat that as a mismatch.
-	var stored string
-	err := w.db.QueryRow(`SELECT value FROM sync_state WHERE key = 'schema_version'`).Scan(&stored)
-	log.Printf("Expected schema version: %s, found schema version: %s", expected, stored)
-	if err == nil && stored == expected {
-		return nil // schema is current
-	}
-
-	// Drop all user tables and recreate. Query sqlite_master so we never
-	// leave orphaned tables from a previous schema version.
-	rows, err := w.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
-	if err != nil {
-		return fmt.Errorf("list tables: %w", err)
-	}
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan table name: %w", err)
-		}
-		tables = append(tables, name)
-	}
-	rows.Close()
-	for _, t := range tables {
-		log.Printf("Schema migration: dropping table %s", t)
-		if _, err := w.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t)); err != nil {
-			return fmt.Errorf("drop table %s: %w", t, err)
-		}
-	}
-
-	if err := createSchema(w.db); err != nil {
-		return err
-	}
-
-	return w.SetSyncState("schema_version", expected)
 }
 
 // EntityRecord holds the data for a single entity upsert within a batch.
+// Mappings is a flat array of "P<id>:<value>" strings.
 type EntityRecord struct {
+	WikidataID string
+	Mappings   []string
+}
+
+// RawEntityRecord holds a single entity with canonical mappings JSON already
+// encoded and ready to persist.
+type RawEntityRecord struct {
 	WikidataID  string
-	ExternalIDs map[int][]string // property ID → values
-	Modified    time.Time        // entity's last-modified time (used as viewed_at)
+	RawMappings string
 }
 
-// UpsertEntity inserts or updates an entity and its mappings atomically.
-func (w *Writer) UpsertEntity(wikidataID string, externalIDs map[int][]string) error {
-	return w.UpsertEntitiesBatch([]EntityRecord{{
-		WikidataID:  wikidataID,
-		ExternalIDs: externalIDs,
-	}})
+// scriptKeys returns the KEYS shared by upsert/delete Lua scripts.
+func scriptKeys() []string {
+	return []string{changelogKey}
 }
 
-// UpsertEntitiesBatch inserts or updates multiple entities in a single transaction.
-// This amortises transaction overhead across the entire batch, which is
-// dramatically faster than individual UpsertEntity calls during bulk imports.
-// Each record's Modified time is used as viewed_at. The stored viewed_at is
-// never decreased (SQL max ensures monotonicity).
-func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
-	if len(records) == 0 {
-		return nil
-	}
-
-	tx, err := w.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	entityStmt, err := tx.Prepare(`
-		INSERT INTO entity (wikidata_id, viewed_at) VALUES (?, ?)
-		ON CONFLICT(wikidata_id) DO UPDATE SET
-			viewed_at = max(excluded.viewed_at, entity.viewed_at)
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare entity upsert: %w", err)
-	}
-	defer entityStmt.Close()
-
-	deleteStmt, err := tx.Prepare(`DELETE FROM mapping WHERE wikidata_id = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare delete: %w", err)
-	}
-	defer deleteStmt.Close()
-
-	idStmt, err := tx.Prepare(`
-		INSERT INTO mapping (property, value, wikidata_id)
-		VALUES (?, ?, ?)
-		ON CONFLICT(property, value) DO UPDATE SET
-			wikidata_id = excluded.wikidata_id
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare mapping insert: %w", err)
-	}
-	defer idStmt.Close()
-
-	for _, rec := range records {
-		id, err := qidToInt(rec.WikidataID)
-		if err != nil {
-			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
-		}
-		viewedAt := rec.Modified.Unix()
-		if viewedAt <= 0 {
-			viewedAt = time.Now().Unix()
-		}
-		if _, err := entityStmt.Exec(id, viewedAt); err != nil {
-			return fmt.Errorf("upsert entity %s: %w", rec.WikidataID, err)
-		}
-		if _, err := deleteStmt.Exec(id); err != nil {
-			return fmt.Errorf("delete old mappings for %s: %w", rec.WikidataID, err)
-		}
-		for property, values := range rec.ExternalIDs {
-			for _, val := range values {
-				if _, err := idStmt.Exec(property, val, id); err != nil {
-					return fmt.Errorf("insert mapping (P%d, %s): %w", property, val, err)
-				}
-			}
-		}
-	}
-
-	return tx.Commit()
+// Pipe wraps a Redis pipeline with store-level operations using a sticky
+// error pattern. All methods silently no-op after the first error.
+// Call Exec to flush the pipeline and return the first error, if any.
+type Pipe struct {
+	ctx  context.Context
+	pipe redis.Pipeliner
+	w    *Writer
+	err  error
 }
 
-// SeedEntitiesBatch inserts or updates multiple entities during a seed import.
-// Unlike UpsertEntitiesBatch, it uses dumpTime (not the entity's Modified time)
-// for viewed_at, and only writes mappings when the entity is new or when the
-// entity's Modified time is newer than the existing viewed_at. This avoids
-// overwriting fresher data that was written by the event stream between seeds.
-func (w *Writer) SeedEntitiesBatch(dumpTime time.Time, records []EntityRecord) error {
-	if len(records) == 0 {
-		return nil
+// NewPipe creates a Pipe that queues store operations into a single Redis
+// pipeline round-trip. The caller must call Exec to flush.
+// If script loading fails, the error is captured in the Pipe and returned
+// by Exec, so callers never need to check NewPipe for errors.
+func (w *Writer) NewPipe(ctx context.Context) *Pipe {
+	p := &Pipe{ctx: ctx, w: w}
+	if err := w.loadScripts(ctx); err != nil {
+		p.err = err
+		return p
 	}
-
-	tx, err := w.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	queryStmt, err := tx.Prepare(`SELECT viewed_at FROM entity WHERE wikidata_id = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare viewed_at query: %w", err)
-	}
-	defer queryStmt.Close()
-
-	entityStmt, err := tx.Prepare(`
-		INSERT INTO entity (wikidata_id, viewed_at) VALUES (?, ?)
-		ON CONFLICT(wikidata_id) DO UPDATE SET
-			viewed_at = max(excluded.viewed_at, entity.viewed_at)
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare entity upsert: %w", err)
-	}
-	defer entityStmt.Close()
-
-	deleteStmt, err := tx.Prepare(`DELETE FROM mapping WHERE wikidata_id = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare delete: %w", err)
-	}
-	defer deleteStmt.Close()
-
-	idStmt, err := tx.Prepare(`
-		INSERT INTO mapping (property, value, wikidata_id)
-		VALUES (?, ?, ?)
-		ON CONFLICT(property, value) DO UPDATE SET
-			wikidata_id = excluded.wikidata_id
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare mapping insert: %w", err)
-	}
-	defer idStmt.Close()
-
-	dumpUnix := dumpTime.Unix()
-
-	for _, rec := range records {
-		id, err := qidToInt(rec.WikidataID)
-		if err != nil {
-			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
-		}
-
-		// Check existing viewed_at to decide what needs updating.
-		var existingViewedAt int64
-		isNew := true
-		if err := queryStmt.QueryRow(id).Scan(&existingViewedAt); err == nil {
-			isNew = false
-		}
-
-		needMappings := isNew || rec.Modified.Unix() > existingViewedAt
-		needEntityUpsert := needMappings || dumpUnix > existingViewedAt
-
-		if !needEntityUpsert && !needMappings {
-			continue
-		}
-
-		// Set viewed_at = max(dumpTime, in-db viewed_at).
-		if needEntityUpsert {
-			if _, err := entityStmt.Exec(id, dumpUnix); err != nil {
-				return fmt.Errorf("upsert entity %s: %w", rec.WikidataID, err)
-			}
-		}
-
-		// Only write mappings if entity is new or its Modified time is
-		// newer than what was already stored.
-		if needMappings {
-			if _, err := deleteStmt.Exec(id); err != nil {
-				return fmt.Errorf("delete old mappings for %s: %w", rec.WikidataID, err)
-			}
-			for property, values := range rec.ExternalIDs {
-				for _, val := range values {
-					if _, err := idStmt.Exec(property, val, id); err != nil {
-						return fmt.Errorf("insert mapping (P%d, %s): %w", property, val, err)
-					}
-				}
-			}
-		}
-	}
-
-	return tx.Commit()
+	p.pipe = w.rdb.Pipeline()
+	return p
 }
 
-// DeleteEntity removes an entity and its mappings.
-func (w *Writer) DeleteEntity(wikidataID string) error {
-	return w.DeleteEntitiesBatch([]string{wikidataID})
+// UpsertRawEntity queues an upsert of an entity with pre-encoded mappings JSON.
+func (p *Pipe) UpsertRawEntity(rec RawEntityRecord) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(rec.WikidataID)
+	if err != nil {
+		p.err = fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
+		return
+	}
+	if rec.RawMappings == "" {
+		p.err = fmt.Errorf("raw mappings empty for %s", rec.WikidataID)
+		return
+	}
+	eid := strconv.FormatInt(id, 10)
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), rec.RawMappings, eid)
 }
 
-// DeleteEntitiesBatch removes multiple entities and their mappings in a
-// single transaction. Mapping rows are removed via CASCADE.
-func (w *Writer) DeleteEntitiesBatch(qids []string) error {
+// UpsertEntity queues an upsert of an entity, encoding its mappings to
+// canonical JSON.
+func (p *Pipe) UpsertEntity(rec EntityRecord) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(rec.WikidataID)
+	if err != nil {
+		p.err = fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
+		return
+	}
+	for _, entry := range rec.Mappings {
+		if _, _, err := parseFlatMappingEntry(entry); err != nil {
+			p.err = fmt.Errorf("invalid mapping for %s: %q: %w", rec.WikidataID, entry, err)
+			return
+		}
+	}
+	mJSON := canonicalMappingsJSON(rec.Mappings)
+	eid := strconv.FormatInt(id, 10)
+	upsertScript.Run(p.ctx, p.pipe, scriptKeys(), mJSON, eid)
+}
+
+// DeleteEntity queues a delete of an entity by QID string (e.g. "Q123").
+func (p *Pipe) DeleteEntity(qid string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(qid)
+	if err != nil {
+		p.err = err
+		return
+	}
+	eid := strconv.FormatInt(id, 10)
+	deleteScript.Run(p.ctx, p.pipe, scriptKeys(), eid)
+}
+
+// SetSyncState queues an HSET on the meta hash.
+func (p *Pipe) SetSyncState(key, value string) {
+	if p.err != nil {
+		return
+	}
+	p.pipe.HSet(p.ctx, metaKey, key, value)
+}
+
+// DelSyncStates queues an HDEL on the meta hash for the given keys.
+func (p *Pipe) DelSyncStates(keys ...string) {
+	if p.err != nil {
+		return
+	}
+	p.pipe.HDel(p.ctx, metaKey, keys...)
+}
+
+// EnqueueEntities queues an SADD of QIDs into the pending set.
+func (p *Pipe) EnqueueEntities(qids []string) {
+	if p.err != nil {
+		return
+	}
 	if len(qids) == 0 {
-		return nil
+		return
 	}
-	tx, err := w.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`DELETE FROM entity WHERE wikidata_id = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare delete: %w", err)
-	}
-	defer stmt.Close()
-
+	members := make([]interface{}, 0, len(qids))
 	for _, qid := range qids {
 		id, err := qidToInt(qid)
 		if err != nil {
-			return err
+			p.err = err
+			return
 		}
-		if _, err := stmt.Exec(id); err != nil {
-			return fmt.Errorf("delete entity %s: %w", qid, err)
-		}
+		members = append(members, strconv.FormatInt(id, 10))
 	}
-	return tx.Commit()
+	p.pipe.SAdd(p.ctx, pendingKey, members...)
 }
 
-// SweepStaleEntities deletes entities (and their mappings via CASCADE)
-// whose viewed_at is older than beforeUnix. Returns the number of entity
-// rows removed.
-func (w *Writer) SweepStaleEntities(beforeUnix int64) (int64, error) {
-	result, err := w.db.Exec(`DELETE FROM entity WHERE viewed_at < ?`, beforeUnix)
-	if err != nil {
-		return 0, fmt.Errorf("sweep stale entities: %w", err)
+// AckProcessedEntities queues an SREM of QIDs from the processing set.
+func (p *Pipe) AckProcessedEntities(qids []string) {
+	if p.err != nil {
+		return
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
+	if len(qids) == 0 {
+		return
 	}
-	return rows, nil
+	members := make([]interface{}, 0, len(qids))
+	for _, qid := range qids {
+		id, err := qidToInt(qid)
+		if err != nil {
+			p.err = err
+			return
+		}
+		members = append(members, strconv.FormatInt(id, 10))
+	}
+	p.pipe.SRem(p.ctx, processingKey, members...)
 }
 
-// ClearSyncCursors resets the stream resumption state (dump_time,
-// last_event_id) so the next startup triggers a reseed.
-func (w *Writer) ClearSyncCursors() error {
-	for _, key := range []string{"dump_time", "last_event_id"} {
-		if err := w.SetSyncState(key, ""); err != nil {
-			return fmt.Errorf("clear %s: %w", key, err)
+// RecordFailedEntity queues a Lua script that records a processing failure.
+func (p *Pipe) RecordFailedEntity(wikidataID, errMsg string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(wikidataID)
+	if err != nil {
+		p.err = err
+		return
+	}
+	now := time.Now().UTC()
+	idStr := strconv.FormatInt(id, 10)
+	failKey := fmt.Sprintf("failed:%d", id)
+	recordFailedScript.Run(p.ctx, p.pipe,
+		[]string{failedZsetKey, failKey},
+		idStr, errMsg, now.Format(time.RFC3339), now.UnixMicro(),
+	)
+}
+
+// DeleteFailedEntity queues removal of a failure record (ZREM + DEL).
+func (p *Pipe) DeleteFailedEntity(wikidataID string) {
+	if p.err != nil {
+		return
+	}
+	id, err := qidToInt(wikidataID)
+	if err != nil {
+		p.err = err
+		return
+	}
+	p.pipe.ZRem(p.ctx, failedZsetKey, strconv.FormatInt(id, 10))
+	p.pipe.Del(p.ctx, fmt.Sprintf("failed:%d", id))
+}
+
+// Exec flushes the pipeline and returns the first error encountered during
+// queueing or execution.
+func (p *Pipe) Exec() error {
+	if p.err != nil {
+		return p.err
+	}
+	cmds, err := p.pipe.Exec(p.ctx)
+	if err != nil && err != redis.Nil {
+		for _, cmd := range cmds {
+			if cmd.Err() != nil && cmd.Err() != redis.Nil {
+				return cmd.Err()
+			}
 		}
+		return err
 	}
 	return nil
 }
 
-// SetSyncState stores a key-value pair in the sync_state table.
-func (w *Writer) SetSyncState(key, value string) error {
-	_, err := w.db.Exec(`
-		INSERT INTO sync_state (key, value) VALUES (?, ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value
-	`, key, value)
-	return err
+// recordFailedScript atomically records a failure: creates or updates the
+// failed:<id> hash and adds the entity to the failed ZSET.
+// KEYS[1] = failedZsetKey, KEYS[2] = failed:<id>
+// ARGV[1] = id (string), ARGV[2] = errMsg, ARGV[3] = now (RFC3339), ARGV[4] = unix timestamp
+var recordFailedScript = redis.NewScript(`
+local exists = redis.call('EXISTS', KEYS[2])
+if exists == 1 then
+  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'last_failed', ARGV[3])
+  redis.call('HINCRBY', KEYS[2], 'attempts', 1)
+else
+  redis.call('HSET', KEYS[2], 'error', ARGV[2], 'attempts', 1, 'first_failed', ARGV[3], 'last_failed', ARGV[3])
+end
+redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1])
+return 1
+`)
+
+// FlushData drops all data and re-initialises the schema version.
+func (w *Writer) FlushData() error {
+	return w.FlushDataContext(context.Background())
 }
 
-// GetSyncState retrieves a value from the sync_state table.
-func (w *Writer) GetSyncState(key string) (string, error) {
-	var value string
-	err := w.db.QueryRow(`SELECT value FROM sync_state WHERE key = ?`, key).Scan(&value)
-	if err == sql.ErrNoRows {
-		return "", nil
+// FlushDataContext drops all data and re-initialises the schema version
+// using the provided context.
+func (w *Writer) FlushDataContext(ctx context.Context) error {
+	if err := w.rdb.FlushDB(ctx).Err(); err != nil {
+		return fmt.Errorf("flush database: %w", err)
 	}
-	return value, err
+	return w.rdb.HSet(ctx, metaKey, "schema_version", SchemaVersion()).Err()
 }
 
-// RecordFailedEntity records a processing failure for later retry.
-// If the entity already has a failure record, it increments the attempt count.
-func (w *Writer) RecordFailedEntity(wikidataID, errMsg string) error {
-	id, err := qidToInt(wikidataID)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err = w.db.Exec(`
-		INSERT INTO failed_entity (wikidata_id, error, attempts, first_failed_at, last_failed_at)
-		VALUES (?, ?, 1, ?, ?)
-		ON CONFLICT(wikidata_id) DO UPDATE SET
-			error = excluded.error,
-			attempts = failed_entity.attempts + 1,
-			last_failed_at = excluded.last_failed_at
-	`, id, errMsg, now, now)
-	return err
-}
+const (
+	// DefaultChangelogRetention is how long changelog entries are kept.
+	DefaultChangelogRetention = 168 * time.Hour // 7 days
 
-// LastFailedEntities returns up to limit failed entity IDs for retry, oldest first.
-func (w *Writer) LastFailedEntities(limit int) ([]string, error) {
-	rows, err := w.db.Query(
-		`SELECT wikidata_id FROM failed_entity ORDER BY last_failed_at ASC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	// trimBatchSize bounds a single XRANGE+XTRIM cycle. It must be large
+	// enough that the trimmer can keep up with seed-time write rates (the
+	// seed upsert path XADDs to the changelog for every entity, typically
+	// well over 1k/s), but small enough that the XRANGE response and per-
+	// call XTRIM work stay modest. Entries are small (QID + mappings JSON),
+	// so 10k per cycle is a few MB on the wire.
+	trimBatchSize = 10000
+	trimInterval  = 5 * time.Minute
+	// trimBacklogDelay is a short yield between cycles while a backlog is
+	// being drained. It exists only to keep the select loop responsive to
+	// ctx.Done(); we do not want to rate-limit draining itself, since the
+	// write side (especially during seeding with CHANGELOG_RETENTION=0)
+	// can easily outpace a once-per-second trimmer.
+	trimBacklogDelay = 10 * time.Millisecond
+	trimErrorDelay   = 5 * time.Minute
+)
 
-	var qids []string
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
+// RunChangelogTrimmer periodically trims the changelog stream, removing
+// entries older than the retention period. It adapts its tick rate: when a
+// full batch is removed (backlog), the next tick fires quickly; otherwise
+// it waits trimInterval. On errors it backs off before retrying.
+func RunChangelogTrimmer(ctx context.Context, w *Writer, retention time.Duration) {
+	slog.Info("trimmer: starting", "retention", retention, "interval", trimInterval)
+	timer := time.NewTimer(0) // fire immediately on start
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			cutoff := time.Now().Add(-retention)
+			minID := fmt.Sprintf("%d-0", cutoff.UnixMilli())
+			n, err := w.StreamTrimOlderThan(ctx, minID, trimBatchSize)
+			if err != nil {
+				slog.Error("trimmer: trim failed", "error", err)
+				timer.Reset(trimErrorDelay)
+			} else if n >= trimBatchSize {
+				slog.Info("trimmer: trimmed old entries (backlog)", "removed", n, "retention", retention)
+				timer.Reset(trimBacklogDelay)
+			} else {
+				if n > 0 {
+					slog.Info("trimmer: trimmed old entries", "removed", n, "retention", retention)
+				}
+				timer.Reset(trimInterval)
+			}
 		}
-		qids = append(qids, intToQid(id))
 	}
-	return qids, rows.Err()
 }
 
-// DeleteFailedEntity removes a failure record after successful retry.
-func (w *Writer) DeleteFailedEntity(wikidataID string) error {
-	id, err := qidToInt(wikidataID)
+// TrimChangelog removes all entries from the changelog stream.
+func (w *Writer) TrimChangelog() error {
+	ctx := context.Background()
+	return w.rdb.Del(ctx, changelogKey).Err()
+}
+
+// StreamTrimOlderThan removes up to limit changelog entries with IDs strictly
+// less than minID. It uses XRANGE to find a bounded batch of old entries,
+// then XTRIM MINID to remove them from the head. This avoids passing a
+// far-in-the-past cutoff directly to XTRIM MINID, which could try to delete
+// millions of entries at once and OOM the server.
+// Returns the number of entries removed.
+func (w *Writer) StreamTrimOlderThan(ctx context.Context, minID string, limit int64) (int64, error) {
+	old, err := w.rdb.XRangeN(ctx, changelogKey, "-", "("+minID, limit+1).Result()
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("xrange: %w", err)
 	}
-	_, err = w.db.Exec(`DELETE FROM failed_entity WHERE wikidata_id = ?`, id)
-	return err
-}
-
-// EnqueueEntities inserts QIDs into the pending_entity queue.
-// Duplicates are silently ignored via INSERT OR IGNORE.
-// Returns the number of rows actually inserted.
-func (w *Writer) EnqueueEntities(qids []string) (int, error) {
-	if len(qids) == 0 {
+	if len(old) == 0 {
 		return 0, nil
 	}
-	tx, err := w.db.Begin()
-	if err != nil {
-		return 0, fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO pending_entity (wikidata_id) VALUES (?)`)
-	if err != nil {
-		return 0, fmt.Errorf("prepare enqueue: %w", err)
-	}
-	defer stmt.Close()
-
-	var inserted int
-	for _, qid := range qids {
-		id, err := qidToInt(qid)
-		if err != nil {
-			return 0, err
-		}
-		result, err := stmt.Exec(id)
-		if err != nil {
-			return 0, fmt.Errorf("enqueue %s: %w", qid, err)
-		}
-		n, _ := result.RowsAffected()
-		inserted += int(n)
-	}
-	return inserted, tx.Commit()
+	// Use the last returned entry's ID as the MINID cutoff. XTRIM MINID
+	// keeps entries with ID >= minID, so this entry itself survives and
+	// will be cleaned up on the next tick.
+	trimID := old[len(old)-1].ID
+	return w.rdb.XTrimMinID(ctx, changelogKey, trimID).Result()
 }
 
-// PeekPendingBatch returns up to limit QIDs from the pending queue
-// without removing them. Use DeletePendingEntities to remove after processing.
-func (w *Writer) PeekPendingBatch(limit int) ([]string, error) {
-	rows, err := w.db.Query(`SELECT wikidata_id FROM pending_entity LIMIT ?`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("dequeue pending: %w", err)
-	}
-	defer rows.Close()
+// claimScript atomically pops up to ARGV[1] members from KEYS[1] (pending),
+// adds them to KEYS[2] (processing), and returns them.
+var claimScript = redis.NewScript(`
+local members = redis.call('SPOP', KEYS[1], ARGV[1])
+if #members == 0 then return {} end
+for _, m in ipairs(members) do
+  redis.call('SADD', KEYS[2], m)
+end
+return members
+`)
 
-	var qids []string
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan pending: %w", err)
+// ClaimPendingBatch atomically moves up to limit QIDs from the pending set
+// into the processing set and returns them. This is crash-safe: on recovery,
+// anything left in processing can be moved back to pending.
+func (w *Writer) ClaimPendingBatch(limit int) ([]string, error) {
+	ctx := context.Background()
+	result, err := claimScript.Run(ctx, w.rdb, []string{pendingKey, processingKey}, limit).StringSlice()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	qids := make([]string, 0, len(result))
+	for _, m := range result {
+		id, err := strconv.ParseInt(m, 10, 64)
+		if err != nil {
+			continue
 		}
 		qids = append(qids, intToQid(id))
 	}
-	return qids, rows.Err()
+	return qids, nil
 }
 
-// DeletePendingEntities removes the given QIDs from the pending queue.
-func (w *Writer) DeletePendingEntities(qids []string) error {
-	if len(qids) == 0 {
+// RecoverProcessing moves any QIDs left in the processing set back to
+// pending. This must be called at startup to recover from a previous crash.
+func (w *Writer) RecoverProcessing() error {
+	ctx := context.Background()
+	// SUNIONSTORE pending pending processing → merges processing into pending.
+	if err := w.rdb.SUnionStore(ctx, pendingKey, pendingKey, processingKey).Err(); err != nil {
+		return fmt.Errorf("recover processing set: %w", err)
+	}
+	return w.rdb.Del(ctx, processingKey).Err()
+}
+
+// Close is a no-op for Writer; the underlying Client manages the connection.
+func (w *Writer) Close() error {
+	return nil
+}
+
+// MigrateSchema checks the stored schema version and flushes all data if it
+// does not match the current SchemaVersion().
+func (w *Writer) MigrateSchema() error {
+	ctx := context.Background()
+	expected := SchemaVersion()
+
+	stored, err := w.rdb.HGet(ctx, metaKey, "schema_version").Result()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+
+	if stored == expected {
+		slog.Debug("schema version already up to date", "version", expected)
 		return nil
 	}
-	tx, err := w.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+
+	if err == redis.Nil {
+		slog.Info("schema version missing; initializing metadata", "expected", expected)
+	} else {
+		slog.Info("schema version mismatch", "expected", expected, "found", stored)
 	}
-	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`DELETE FROM pending_entity WHERE wikidata_id = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare delete pending: %w", err)
+	slog.Info("schema migration: flushing database")
+	if err := w.rdb.FlushDB(ctx).Err(); err != nil {
+		return fmt.Errorf("flush database: %w", err)
 	}
-	defer stmt.Close()
 
-	for _, qid := range qids {
-		id, err := qidToInt(qid)
-		if err != nil {
-			return err
-		}
-		if _, err := stmt.Exec(id); err != nil {
-			return fmt.Errorf("delete pending %s: %w", qid, err)
-		}
+	return w.rdb.HSet(ctx, metaKey, "schema_version", expected).Err()
+}
+
+// propKey returns the Kvrocks hash key for a property reverse-index.
+func propKey(property int) string {
+	return fmt.Sprintf("p:%d", property)
+}
+
+// canonicalMappingsJSON produces a deterministic JSON encoding of mappings
+// as a flat array of "P<id>:<value>" strings (e.g. ["P345:tt0111161"]).
+// The input is expected to already be in canonical order (sorted by numeric
+// property, rank, then value) as produced by extractExternalIDs.
+// Byte-level string comparison in Lua detects no-ops reliably.
+func canonicalMappingsJSON(entries []string) string {
+	if len(entries) == 0 {
+		return "[]"
 	}
-	return tx.Commit()
+	data, _ := json.Marshal(entries)
+	return string(data)
 }
 
-// PendingCount returns the number of entities in the pending queue.
-func (w *Writer) PendingCount() (int64, error) {
-	var count int64
-	err := w.db.QueryRow(`SELECT COUNT(*) FROM pending_entity`).Scan(&count)
-	return count, err
+func parseFlatMappingEntry(entry string) (string, string, error) {
+	if !strings.HasPrefix(entry, "P") {
+		return "", "", fmt.Errorf("must start with P")
+	}
+
+	colonIdx := strings.IndexByte(entry, ':')
+	if colonIdx < 2 || colonIdx == len(entry)-1 {
+		return "", "", fmt.Errorf("must be in P<id>:<value> format")
+	}
+
+	prop := entry[1:colonIdx]
+	if _, err := strconv.Atoi(prop); err != nil {
+		return "", "", fmt.Errorf("invalid property %q", prop)
+	}
+
+	val := entry[colonIdx+1:]
+	return prop, val, nil
 }
 
-// Close closes the database connection.
-func (w *Writer) Close() error {
-	return w.db.Close()
-}
-
-// DB returns the underlying database connection (for testing).
-func (w *Writer) DB() *sql.DB {
-	return w.db
-}
-
-// qidToInt converts a Wikidata QID string (e.g., "Q172241") to an integer (e.g., 172241).
+// qidToInt converts a Wikidata QID string (e.g., "Q172241") to an integer.
 func qidToInt(qid string) (int64, error) {
 	if len(qid) == 0 || (qid[0] != 'Q' && qid[0] != 'q') {
 		return 0, fmt.Errorf("invalid QID format: %s", qid)
@@ -564,7 +630,7 @@ func qidToInt(qid string) (int64, error) {
 	return n, nil
 }
 
-// intToQid converts an integer (e.g., 172241) to a Wikidata QID string (e.g., "Q172241").
+// intToQid converts an integer to a Wikidata QID string.
 func intToQid(n int64) string {
 	return fmt.Sprintf("Q%d", n)
 }

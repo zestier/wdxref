@@ -1,20 +1,17 @@
 package watcher
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/goccy/go-json"
 )
-
-// ErrEntityNotFound indicates the entity no longer exists on Wikidata (HTTP 404).
-var ErrEntityNotFound = errors.New("entity not found")
 
 // RateLimitedError is returned when Wikidata responds with HTTP 429
 // or a maxlag error.
@@ -29,24 +26,34 @@ func (e *RateLimitedError) Error() string {
 
 // WikidataEntity represents relevant data extracted from a Wikidata entity.
 type WikidataEntity struct {
-	ID          string
-	ExternalIDs map[int][]string // Wikidata property number → values
-	Modified    time.Time        // entity's last-modified time
+	ID       string
+	Mappings []string // flat array of "P<id>:<value>" entries
 }
 
 // WikidataClient fetches entity data from Wikidata.
 // It tracks consecutive maxlag errors and applies exponential backoff
 // (capped at maxlagBackoffMax) to avoid hammering a struggling server.
+// The maxlag query parameter starts at wikimediaMaxlag and increases by
+// one second per minute of cumulative maxlag wait, capped at maxlagParamMax.
 type WikidataClient struct {
-	client        *http.Client
-	baseURL       string
-	maxlagBackoff time.Duration // current backoff; 0 when healthy
+	client          *http.Client
+	baseURL         string
+	maxlagBackoff   time.Duration // current backoff; 0 when healthy
+	maxlagWaitTotal time.Duration // cumulative time spent waiting on maxlag
 }
 
 const (
 	maxlagBackoffInit = 10 * time.Second // initial backoff after first maxlag
 	maxlagBackoffMax  = 5 * time.Minute  // cap for exponential backoff
+	maxlagParamMax    = 30.0             // upper bound for dynamic maxlag parameter
 )
+
+// maxlagParam returns the current maxlag query-parameter value as a string.
+// It starts at wikimediaMaxlag and increases by one per minute of cumulative
+// maxlag wait, capped at maxlagParamMax.
+func (c *WikidataClient) maxlagParam() string {
+	return fmt.Sprintf("%d", int(min(wikimediaMaxlag+c.maxlagWaitTotal.Minutes(), maxlagParamMax)))
+}
 
 // NewWikidataClient creates a new Wikidata API client.
 // The client's transport should include throttling (ThrottleTransport)
@@ -64,7 +71,7 @@ func NewWikidataClient(client *http.Client) *WikidataClient {
 // EntityResult holds the raw JSON for a single entity from a batch fetch,
 // or marks it as missing (deleted on Wikidata).
 type EntityResult struct {
-	Data    []byte // Raw JSON for the full response (contains all entities)
+	Data    []byte // Raw JSON for the single entity object
 	Missing bool   // True if the entity was deleted/missing on Wikidata
 }
 
@@ -80,8 +87,8 @@ func (c *WikidataClient) FetchEntitiesRaw(qids []string) (map[string]EntityResul
 		return nil, fmt.Errorf("wbgetentities: batch size %d exceeds limit of 50", len(qids))
 	}
 
-	apiURL := fmt.Sprintf("%s/w/api.php?action=wbgetentities&format=json&maxlag=%d&props=claims%%7Cinfo&ids=%s",
-		c.baseURL, wikimediaMaxlag, strings.Join(qids, "%7C"))
+	apiURL := fmt.Sprintf("%s/w/api.php?action=wbgetentities&format=json&redirects=no&maxlag=%s&props=claims&ids=%s",
+		c.baseURL, c.maxlagParam(), strings.Join(qids, "%7C"))
 
 	req, err := newRequest("GET", apiURL)
 	if err != nil {
@@ -136,29 +143,38 @@ func (c *WikidataClient) FetchEntitiesRaw(qids []string) (map[string]EntityResul
 		}
 		c.maxlagBackoff = min(c.maxlagBackoff, maxlagBackoffMax)
 		retryAfter = max(retryAfter, c.maxlagBackoff)
-		log.Printf("Maxlag backoff: %v (lag=%.1fs, next will be %v if consecutive)", retryAfter, apiErr.Error.Lag, min(c.maxlagBackoff*2, maxlagBackoffMax))
+		c.maxlagWaitTotal += retryAfter
+		slog.Warn("maxlag backoff", "delay", retryAfter, "lag", apiErr.Error.Lag, "next_backoff", min(c.maxlagBackoff*2, maxlagBackoffMax), "next_maxlag", c.maxlagParam())
 		return nil, &RateLimitedError{RetryAfter: retryAfter, Maxlag: true}
 	}
 
-	// Successful response — reset maxlag backoff.
+	// Successful response — reset maxlag backoff and cumulative wait.
 	c.maxlagBackoff = 0
+	c.maxlagWaitTotal = 0
 
-	// Parse just the top-level structure to identify per-entity data and missing status.
+	// Parse the top-level structure. Check for non-maxlag API errors first:
+	// the response may be valid JSON with an "error" key but no "entities"
+	// key (e.g. readonly mode, internal errors). Without this check, a
+	// missing "entities" map causes every QID to be treated as deleted.
 	var envelope struct {
 		Entities map[string]json.RawMessage `json:"entities"`
+		Error    *struct {
+			Code string `json:"code"`
+			Info string `json:"info"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("parse entities response: %w", err)
 	}
+	if envelope.Error != nil {
+		return nil, fmt.Errorf("wbgetentities API error: %s: %s", envelope.Error.Code, envelope.Error.Info)
+	}
+	if len(envelope.Entities) == 0 {
+		return nil, fmt.Errorf("wbgetentities returned no entities")
+	}
 
-	results := make(map[string]EntityResult, len(qids))
-	for _, qid := range qids {
-		raw, ok := envelope.Entities[qid]
-		if !ok {
-			results[qid] = EntityResult{Missing: true}
-			continue
-		}
-
+	results := make(map[string]EntityResult, len(envelope.Entities))
+	for qid, raw := range envelope.Entities {
 		// Check for the "missing" key that wbgetentities uses for deleted entities.
 		var fields map[string]json.RawMessage
 		if json.Unmarshal(raw, &fields) == nil {
@@ -168,109 +184,35 @@ func (c *WikidataClient) FetchEntitiesRaw(qids []string) (map[string]EntityResul
 			}
 		}
 
-		// Re-wrap in the {"entities": {"Q...": ...}} format that ParseEntityJSON expects.
-		wrapped := fmt.Sprintf(`{"entities":{%q:%s}}`, qid, raw)
-		results[qid] = EntityResult{Data: []byte(wrapped)}
+		results[qid] = EntityResult{Data: raw}
 	}
 
 	return results, nil
 }
 
-// FetchEntityRaw fetches raw JSON for a single Wikidata entity by Q-number.
-// This is a convenience wrapper around FetchEntitiesRaw for single-entity use.
-// Returns ErrEntityNotFound if the entity is missing/deleted on Wikidata.
-func (c *WikidataClient) FetchEntityRaw(qid string) ([]byte, error) {
-	results, err := c.FetchEntitiesRaw([]string{qid})
-	if err != nil {
-		return nil, fmt.Errorf("fetch entity %s: %w", qid, err)
-	}
-	result, ok := results[qid]
-	if !ok || result.Missing {
-		return nil, fmt.Errorf("fetch entity %s: %w", qid, ErrEntityNotFound)
-	}
-	return result.Data, nil
-}
-
-// FetchEntity fetches and parses a Wikidata entity by Q-number.
-func (c *WikidataClient) FetchEntity(qid string) (*WikidataEntity, error) {
-	body, err := c.FetchEntityRaw(qid)
-	if err != nil {
-		return nil, err
-	}
-	return ParseEntityJSON(qid, body)
-}
-
-// ParseEntityJSON parses Wikidata entity JSON and extracts all external ID
-// claims. Properties with mainsnak.datatype == "external-id" are collected
-// automatically — no hardcoded registry needed.
-func ParseEntityJSON(qid string, data []byte) (*WikidataEntity, error) {
+// ParseEntityJSON parses a bare Wikidata entity JSON object and extracts all
+// external ID claims in a single pass. Non-Q entities return (nil, nil) so
+// property and lexeme lines are silently skipped.
+func ParseEntityJSON(data []byte) (*WikidataEntity, error) {
 	var raw struct {
-		Entities map[string]struct {
-			Claims   claimsMap `json:"claims"`
-			Modified string    `json:"modified"`
-		} `json:"entities"`
-	}
-
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse entity %s: %w", qid, err)
-	}
-
-	entityData, ok := raw.Entities[qid]
-	if !ok {
-		return nil, fmt.Errorf("entity %s not found in response", qid)
-	}
-
-	externalIDs := extractExternalIDs(entityData.Claims)
-	if len(externalIDs) == 0 {
-		return nil, nil
-	}
-
-	var modified time.Time
-	if entityData.Modified != "" {
-		modified, _ = time.Parse(time.RFC3339, entityData.Modified)
-	}
-
-	return &WikidataEntity{
-		ID:          qid,
-		ExternalIDs: externalIDs,
-		Modified:    modified,
-	}, nil
-}
-
-// parseDumpEntity parses a single entity from the Wikidata JSON dump format.
-// The dump format is a bare entity object (no {"entities":{...}} wrapper).
-// Returns nil if the entity has no external IDs.
-func parseDumpEntity(data []byte) (*WikidataEntity, error) {
-	var raw struct {
-		ID       string    `json:"id"`
-		Type     string    `json:"type"`
-		Claims   claimsMap `json:"claims"`
-		Modified string    `json:"modified"`
+		ID     string    `json:"id"`
+		Claims claimsMap `json:"claims"`
 	}
 
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse entity: %w", err)
 	}
 
-	// Only process items (Q-entities), skip properties (P-entities) and lexemes
+	// Skip non-Q entities (properties, lexemes).
 	if !strings.HasPrefix(raw.ID, "Q") {
 		return nil, nil
 	}
 
 	externalIDs := extractExternalIDs(raw.Claims)
-	if len(externalIDs) == 0 {
-		return nil, nil
-	}
-
-	var modified time.Time
-	if raw.Modified != "" {
-		modified, _ = time.Parse(time.RFC3339, raw.Modified)
-	}
 
 	return &WikidataEntity{
-		ID:          raw.ID,
-		ExternalIDs: externalIDs,
-		Modified:    modified,
+		ID:       raw.ID,
+		Mappings: externalIDs,
 	}, nil
 }
 
@@ -283,18 +225,41 @@ type claimsMap map[string][]struct {
 			Type  string          `json:"type"`
 		} `json:"datavalue"`
 	} `json:"mainsnak"`
+	Rank string `json:"rank"`
+}
+
+// rankOrder maps Wikidata claim ranks to sort priority.
+// Lower value = higher priority (preferred first, deprecated last).
+// Normal (the default rank) is zero.
+func rankOrder(rank string) int {
+	switch rank {
+	case "preferred":
+		return -1
+	case "normal", "":
+		return 0
+	case "deprecated":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // extractExternalIDs collects all claims with datatype "external-id"
-// and returns them as a property number → values map.
-func extractExternalIDs(claims claimsMap) map[int][]string {
-	externalIDs := make(map[int][]string)
+// and returns them as a deduplicated flat array of "P<id>:<value>" strings,
+// sorted by property key, then rank (preferred > normal > deprecated),
+// then value.
+func extractExternalIDs(claims claimsMap) []string {
+	type entry struct {
+		propKey string // map key reference, no allocation
+		rank    int
+		value   string
+	}
+	entries := make([]entry, 0, len(claims))
 	for propKey, propClaims := range claims {
 		if len(propKey) < 2 || propKey[0] != 'P' {
 			continue
 		}
-		propNum, err := strconv.Atoi(propKey[1:])
-		if err != nil {
+		if _, err := strconv.Atoi(propKey[1:]); err != nil {
 			continue
 		}
 		for _, claim := range propClaims {
@@ -303,11 +268,34 @@ func extractExternalIDs(claims claimsMap) map[int][]string {
 			}
 			value := extractStringValue(claim.MainSnak.DataValue.Value)
 			if value != "" {
-				externalIDs[propNum] = append(externalIDs[propNum], value)
+				entries = append(entries, entry{
+					propKey: propKey,
+					rank:    rankOrder(claim.Rank),
+					value:   value,
+				})
 			}
 		}
 	}
-	return externalIDs
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].propKey != entries[j].propKey {
+			return entries[i].propKey < entries[j].propKey
+		}
+		if entries[i].rank != entries[j].rank {
+			return entries[i].rank < entries[j].rank
+		}
+		return entries[i].value < entries[j].value
+	})
+	// Duplicates (same propKey + value, different rank) are adjacent after
+	// sorting, so dedup is a simple look-back. String concatenation is
+	// deferred to here so only surviving entries allocate.
+	result := make([]string, 0, len(entries))
+	for i, e := range entries {
+		if i > 0 && entries[i-1].propKey == e.propKey && entries[i-1].value == e.value {
+			continue
+		}
+		result = append(result, e.propKey+":"+e.value)
+	}
+	return result
 }
 
 // extractStringValue extracts a string value from a Wikidata datavalue.
@@ -318,20 +306,6 @@ func extractStringValue(raw json.RawMessage) string {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
-	}
-	return ""
-}
-
-// extractEntityID extracts a Q-number from a wikibase-entityid datavalue.
-func extractEntityID(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var entityRef struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &entityRef); err == nil && strings.HasPrefix(entityRef.ID, "Q") {
-		return entityRef.ID
 	}
 	return ""
 }

@@ -6,18 +6,35 @@ A self-hosted service that builds and maintains a local cache of external identi
 
 ## Why
 
-Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. Querying these mappings live via the Wikidata API or SPARQL endpoint can be slow and rate-limited. ekeid solves this by maintaining a local SQLite database that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API.
+Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. If your application needs to translate between these ID systems ("given this IMDb ID, what's the TMDB ID?"), the usual options are live SPARQL queries or Wikidata API calls — both of which can be slow, rate-limited, and unpredictable under load.
 
-If requested I would probably be willing to host a public instance, but keep in mind that it is unlikely that its performance would exceed directly using a SPARQL query to Wikidata. Where this project is most useful is adding it to a stack that wants to do this kind of remapping quickly and without risking excessive unpredictable spikes in SPARQL queries likely to get you throttled, such as the backend for an application that uses this kind of remapping to satisfy user interactions that desire being as responsive as possible.
+ekeid gives you a local, always-ready lookup service. It maintains a [Kvrocks](https://kvrocks.apache.org/) database (a Redis-compatible, disk-backed key-value store) that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API. Lookups resolve in single-digit milliseconds with no external network calls, making it suitable for user-facing applications where responsiveness matters.
+
+The typical use case is adding ekeid to a stack that needs fast, reliable ID remapping — for example, a media server that wants to cross-reference content across IMDb, TMDB, TVDB, and MusicBrainz without hammering upstream APIs or risking throttling during traffic spikes.
+
+> **Planned feature:** Built-in property aliasing, so you can look up by friendly names like `imdb` or `tmdb` instead of needing to know the Wikidata property IDs (`P345`, `P4947`, etc.).
 
 ## Architecture
 
-ekeid consists of two services:
+ekeid consists of four single-responsibility processes that connect to a shared [Kvrocks](https://kvrocks.apache.org/) instance via TCP:
 
-- **Watcher** — Seeds the database from the latest Wikidata JSON dump (gzip or bzip2), then subscribes to the [Wikimedia EventStreams](https://stream.wikimedia.org/) SSE feed to process entity changes in real time. Changed entities are enqueued and fetched from the Wikidata API in batches. Failed fetches are retried automatically with backoff.
-- **API** — A read-only HTTP server that serves lookup queries against the local database. Includes per-IP rate limiting, CORS support, health checks, and statistics.
+- **Primary** (`cmd/primary`) — Seeds the database from the latest Wikidata JSON dump (gzip or bzip2), then subscribes to the [Wikimedia EventStreams](https://stream.wikimedia.org/) SSE feed to process entity changes in real time. Changed entities are enqueued and fetched from the Wikidata API in batches. Failed fetches are retried automatically with backoff. All changes are appended to a Redis Stream changelog.
+- **Replicator** (`cmd/replicator`) — Reads from Kvrocks and serves replication endpoints over HTTP. Generates periodic zstd-compressed snapshots containing entity lines (`qid + raw mappings JSON`) plus a small number of JSON control lines for resumable range requests and completion handoff, and streams changelog events via SSE using the same raw payloads. Trims the changelog after a configurable retention period (default: 7 days).
+- **Replica** (`cmd/replica`) — Syncs from an upstream replicator into a local Kvrocks instance. On first run, downloads a snapshot. Then connects to the SSE changelog stream for incremental updates. Writes to the local changelog for chaining (a replica's replicator can serve another replica).
+- **API** (`cmd/api`) — A read-only HTTP server that serves lookup queries against Kvrocks. Includes CORS support, health checks, and statistics.
 
-Both services share a single SQLite database file (`ekeid.db`) using WAL mode. The watcher writes; the API reads.
+```
+Primary machine                      Replica machine
+┌──────────────────────────┐         ┌──────────────────────────┐
+│  primary ──writes──→ kvrocks       │  replica ──writes──→ kvrocks
+│  replicator ─reads─→ kvrocks       │  replicator ─reads─→ kvrocks
+│  api ──reads──→ kvrocks            │  api ──reads──→ kvrocks
+└──────────────────────────┘         └──────────────────────────┘
+        │ HTTP (replication)                  │ HTTP (replication)
+        └────────────────────────────────────┘
+              Chainable: each replica's replicator
+              can serve further downstream replicas
+```
 
 ## API Endpoints
 
@@ -38,16 +55,20 @@ curl http://localhost:8080/v1/lookup/P345/tt0111161
 ```
 
 ```json
-{
-  "wikidata_id": "Q172241",
-  "mappings": {
-    "P345": ["tt0111161"],
-    "P4947": ["278"],
-    "P4835": ["2095"],
-    "P8013": ["the-shawshank-redemption"]
+[
+  {
+    "wikidata_id": "Q172241",
+    "mappings": [
+      "P345:tt0111161",
+      "P4947:278",
+      "P4835:2095",
+      "P8013:the-shawshank-redemption"
+    ]
   }
-}
+]
 ```
+
+The response is an array of matching entities. Each entity has a `wikidata_id` and a `mappings` array of `P<id>:<value>` strings. When multiple entities claim the same external ID, all are returned. An empty array is returned when no entity matches.
 
 ### Lookup by Wikidata ID
 
@@ -77,7 +98,7 @@ Returns service status, database size, dump time, and last event sync time. Suit
 GET /v1/stats
 ```
 
-Returns mapping, pending, and failed entity counts along with database metadata. This endpoint executes `COUNT` queries and is more expensive than `/v1/health`.
+Returns entity, pending, and failed entity counts along with database metadata. This endpoint executes `COUNT` queries and is more expensive than `/v1/health`.
 
 > **Note:** If exposing the API publicly, consider restricting access to `/v1/stats` (and potentially `/v1/health`) to operators only — for example, via a reverse proxy. The stats endpoint is expensive and the operational details it exposes are generally not relevant to end users.
 
@@ -93,28 +114,54 @@ Configuration is done through environment variables:
 
 | Variable | Service | Default | Description |
 |---|---|---|---|
-| `CONTACT` | Watcher | *(required)* | URL or email for the [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) |
-| `DB_PATH` | Both | `/data/ekeid.db` | Path to the SQLite database file |
-| `DUMP_FORMAT` | Watcher | `gz` | Dump compression format: `gz` (~150 GB) or `bz2` (~100 GB) |
-| `LISTEN_ADDR` | API | `:8080` | Address for the API server to listen on |
-| `RATE_LIMIT` | API | `10` | Token bucket refill rate (requests per second per IP); set to `0` or `Inf` to disable |
-| `RATE_BURST` | API | `20` | Token bucket capacity (max burst per IP) |
+| `CONTACT` | Primary | *(required)* | URL or email for the [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) |
+| `KVROCKS_ADDR` | All | `localhost:6666` | Address of the Kvrocks instance |
+| `DUMP_FORMAT` | Primary | `gz` | Dump compression format: `gz` (~150 GB) or `bz2` (~100 GB) |
+| `LISTEN_ADDR` | API, Replicator | `:8080`, `:8081` | Address to listen on |
+| `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
+| `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
+| `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |
+| `CHANGELOG_RETENTION` | Primary, Replica | `168h` | How long to retain changelog entries; `0` trims entries on every tick (effectively disabled for leaf replicas); also accepts a plain integer as hours |
+| `ENCODINGS` | API, Replica, Replicator | `zstd,gzip` | Comma-separated list of compression encodings to use; set to empty to disable compression |
 
 ### Running
 
-1. Set the required `CONTACT` variable:
+There are three example Compose files under `examples/` for different deployment scenarios:
 
-   ```bash
-   export CONTACT="you@example.com"  # or a URL, per Wikimedia policy
-   ```
+| Directory | Use case |
+|---|---|
+| `examples/primary/` | **Primary with replication** — full stack with replicator for serving downstream replicas |
+| `examples/standalone/` | **Standalone** — primary + API only, no replication |
+| `examples/replica/` | **Replica** — syncs from an upstream replicator, serves API, and can chain further |
 
-2. Start both services:
+#### Standalone (simplest)
 
-   ```bash
-   docker compose up -d
-   ```
+```bash
+export CONTACT="you@example.com"  # or a URL, per Wikimedia policy
+docker compose -f examples/standalone/docker-compose.yml up -d
+```
 
-On first start the watcher will download and process the latest Wikidata dump. This is a large download (100+ GB compressed) and initial seeding will take a significant amount of time. Once seeded, the watcher switches to real-time streaming and subsequent restarts will not re-download the dump unless it is deemed necessary.
+#### Primary with replication
+
+```bash
+export CONTACT="you@example.com"
+docker compose -f examples/primary/docker-compose.yml up -d
+```
+
+The replicator will be available on port 8081 for downstream replicas.
+
+#### Replica
+
+```bash
+export UPSTREAM_URL="http://primary-host:8081"
+docker compose -f examples/replica/docker-compose.yml up -d
+```
+
+Replicas are chainable — each replica runs its own replicator, so further downstream replicas can sync from it.
+
+---
+
+On first start the primary will download and process the latest Wikidata dump. This is a large download (100+ GB compressed) and initial seeding will take a significant amount of time. Once seeded, the primary switches to real-time streaming and subsequent restarts will not re-download the dump unless it is deemed necessary.
 
 The API will be available at `http://localhost:8080`.
 
@@ -123,11 +170,11 @@ The API will be available at `http://localhost:8080`.
 Requires Go 1.26+.
 
 ```bash
-# Build the API server
+# Build all binaries
+go build -o primary ./cmd/primary
+go build -o replicator ./cmd/replicator
+go build -o replica ./cmd/replica
 go build -o api-server ./cmd/api
-
-# Build the watcher
-go build -o watcher ./cmd/watcher
 ```
 
 ## Running Tests
@@ -138,13 +185,15 @@ go test ./...
 
 ## How It Works
 
-1. **Seeding** — The watcher downloads the latest `latest-all.json.gz` (or `.bz2`) dump from [Wikidata](https://dumps.wikimedia.org/wikidatawiki/entities/). It streams and decompresses the dump, extracting all external-id claims for every entity. These are inserted into the SQLite `mapping` table in batches. The dump's ETag is tracked to support resumable downloads if the connection is interrupted.
+1. **Seeding** — The primary downloads the latest `latest-all.json.gz` (or `.bz2`) dump from [Wikidata](https://dumps.wikimedia.org/wikidatawiki/entities/). It streams and decompresses the dump, extracting all external-id claims for every entity. These are inserted into Kvrocks in batches. The dump's ETag is tracked to support resumable downloads if the connection is interrupted.
 
-2. **Streaming** — After seeding completes, the watcher connects to the [Wikimedia EventStreams](https://stream.wikimedia.org/v2/stream/recentchange) SSE endpoint starting from slightly before the dump timestamp. Wikidata entity edits (namespace 0) are collected, deduplicated, and enqueued into a `pending_entity` table. A background goroutine drains this queue by fetching entities from the Wikidata `wbgetentities` API in batches of up to 50 and upserting their external ID mappings.
+2. **Streaming** — After seeding completes, the primary connects to the [Wikimedia EventStreams](https://stream.wikimedia.org/v2/stream/recentchange) SSE endpoint starting from the stored dump timestamp, or on reconnect from the earliest timestamp embedded in the last stored SSE event ID. Wikidata entity edits (namespace 0) are collected, deduplicated, and enqueued into a pending set. A background goroutine drains this set by fetching entities from the Wikidata `wbgetentities` API in batches of up to 50 and upserting their external ID mappings. All changes are appended to a Redis Stream (`changelog`).
 
-3. **Resilience** — If an entity fetch fails, it is recorded in a `failed_entity` table and retried periodically with backoff. If the EventStream connection drops, the watcher reconnects automatically. If the stream cannot go far enough back in time to cover the last sync point, a full reseed is triggered.
+3. **Replication** — The replicator periodically generates a zstd-compressed snapshot of all entities and serves it over HTTP. Most snapshot lines are `qid + raw mappings JSON`, so replicas can apply them without decoding and re-encoding identical mappings. The snapshot also embeds JSON control lines: frame-start checkpoints advertise legal byte-range resume offsets, and a final `done` line carries the stream ID to continue from once the snapshot is fully applied. Resume uses standard HTTP `Range` and `If-Range` over the compressed bytes. The SSE changelog stream uses the same raw payload strategy for incremental updates. Replicas connect to these endpoints to sync data. Each replica writes changes to its own local changelog, enabling chainable replication. Snapshots are eventually consistent — they are generated via a non-atomic scan, so the snapshot may reflect a mix of states. Replicas converge to a consistent state by replaying the changelog stream after applying the snapshot.
 
-4. **Serving** — The API server opens the same database in read-only mode and serves lookup queries. Responses are cached for 1 hour (`Cache-Control: public, max-age=3600`). Per-IP rate limiting uses a token bucket algorithm.
+4. **Resilience** — If an entity fetch fails, it is recorded and retried periodically with backoff. If the EventStream connection drops, the primary reconnects automatically using a timestamp-derived lower bound from the last stored SSE event ID and verifies that the returned stream still covers that point. If the stream cannot go far enough back in time to cover the last sync point, a full reseed is triggered. Replicas retry on disconnect and fall back to a full snapshot if the changelog no longer covers their position.
+
+5. **Serving** — The API server reads from Kvrocks and serves lookup queries. Responses are cached for 1 hour (`Cache-Control: public, max-age=3600`).
 
 ## License
 

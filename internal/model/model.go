@@ -5,13 +5,14 @@ import "time"
 // LookupResult is returned by API lookups.
 type LookupResult struct {
 	WikidataID int64
-	Mappings   map[int][]string // property ID → values
+	Mappings   []string // flat array of "P<id>:<value>" entries
 }
 
 // HealthInfo holds lightweight health data (no expensive COUNT queries).
 type HealthInfo struct {
 	DatabaseSize  int64
 	DumpTime      time.Time
+	LastEventID   string
 	LastEventSync time.Time
 	State         string
 	SchemaMatch   bool
@@ -19,12 +20,12 @@ type HealthInfo struct {
 
 // DBStats holds database statistics (expensive COUNT queries).
 type DBStats struct {
-	MappingCount  int64
-	EntityCount   int64
-	PendingCount  int64
-	FailedCount   int64
-	DatabaseSize  int64
-	DumpTime      time.Time
-	LastEventSync time.Time
-	State         string
+	HealthInfo
+	EntityCount     int64
+	PendingCount    int64
+	ProcessingCount int64
+	FailedCount     int64
+	StreamLength    int64
+	OldestEvent     time.Time
+	NewestEvent     time.Time
 }

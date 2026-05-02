@@ -10,9 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
-	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +37,7 @@ var ErrDumpChanged = errors.New("dump file changed during download")
 const (
 	dumpBaseURL          = "https://dumps.wikimedia.org/wikidatawiki/entities/latest-all.json."
 	dumpScannerBufSize   = 16 * 1024 * 1024 // 16 MB max line
+	dumpMaxLineSize      = 4 * 1024 * 1024  // 4 MB skip threshold
 	dumpDecompChunkSize  = 256 * 1024       // 256 KB per decompression chunk
 	dumpDecompChanCap    = 64               // up to 16 MB buffered ahead
 	dumpProgressInterval = 30 * time.Second // log progress every 30s
@@ -47,10 +48,37 @@ const (
 	dumpResumeMaxDelay      = 2 * time.Minute // maximum backoff delay
 	dumpResumeBackoffFactor = 2               // exponential backoff multiplier
 
+	dumpWriteMaxRetries = 5               // retries per batch flush to Kvrocks
+	dumpWriteBaseDelay  = 2 * time.Second // initial retry backoff for writes
+
 	// seedVersion is hashed for configFingerprint. Bump when seed-time
 	// configuration changes (e.g. property filters) to trigger a reseed
 	// on next startup without dropping all tables.
 	seedVersion = "v2-property-based"
+
+	dumpDateLookbackDays = 14                                                                           // how far back to look for dated dumps
+	dumpStaleThreshold   = 7 * 24 * time.Hour                                                           // warn if dump is older than this
+	dumpDatePathPattern  = "https://dumps.wikimedia.org/wikidatawiki/entities/%s/wikidata-%s-all.json." // YYYYMMDD date pattern
+)
+
+var (
+	dumpResumeRetryDelay = func(retries int) time.Duration {
+		delay := dumpResumeBaseDelay
+		for i := 1; i < retries; i++ {
+			delay *= time.Duration(dumpResumeBackoffFactor)
+			if delay > dumpResumeMaxDelay {
+				return dumpResumeMaxDelay
+			}
+		}
+		return delay
+	}
+
+	dumpWriteRetryDelay = func(attempt int) time.Duration {
+		if attempt <= 0 {
+			return 0
+		}
+		return dumpWriteBaseDelay << (attempt - 1)
+	}
 )
 
 // countingReader wraps an io.Reader and counts the number of bytes read.
@@ -115,6 +143,7 @@ type resumableBody struct {
 	url        string
 	etag       string
 	offset     int64
+	ctx        context.Context
 	httpClient *http.Client
 	retries    int
 }
@@ -122,11 +151,15 @@ type resumableBody struct {
 // newResumableBody creates a resumableBody. The etag is the value from the
 // initial response. If etag is empty (server doesn't support it), resumption
 // is disabled and it behaves like a normal body.
-func newResumableBody(body io.ReadCloser, url, etag string, httpClient *http.Client) *resumableBody {
+func newResumableBody(ctx context.Context, body io.ReadCloser, url, etag string, httpClient *http.Client) *resumableBody {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &resumableBody{
 		body:       body,
 		url:        url,
 		etag:       etag,
+		ctx:        ctx,
 		httpClient: httpClient,
 	}
 }
@@ -154,21 +187,15 @@ func (rb *resumableBody) reconnect() error {
 		return fmt.Errorf("dump download failed after %d resume attempts", dumpResumeMaxRetries)
 	}
 
-	delay := dumpResumeBaseDelay
-	for i := 1; i < rb.retries; i++ {
-		delay *= time.Duration(dumpResumeBackoffFactor)
-		if delay > dumpResumeMaxDelay {
-			delay = dumpResumeMaxDelay
-			break
-		}
+	delay := dumpResumeRetryDelay(rb.retries)
+	slog.Warn("connection lost, retrying", "offset", rb.offset, "delay", delay, "attempt", rb.retries, "max_attempts", dumpResumeMaxRetries)
+	if err := waitForContext(rb.ctx, delay); err != nil {
+		return err
 	}
-	log.Printf("Connection lost at byte %d, retrying in %v (attempt %d/%d)",
-		rb.offset, delay, rb.retries, dumpResumeMaxRetries)
-	time.Sleep(delay)
 
 	rb.body.Close()
 
-	req, err := newRequest("GET", rb.url)
+	req, err := newRequestWithContext(rb.ctx, "GET", rb.url)
 	if err != nil {
 		return fmt.Errorf("create resume request: %w", err)
 	}
@@ -183,7 +210,7 @@ func (rb *resumableBody) reconnect() error {
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		rb.body = resp.Body
-		log.Printf("Resumed download at byte %d", rb.offset)
+		slog.Info("resumed download", "offset", rb.offset)
 		return nil
 	case http.StatusPreconditionFailed:
 		resp.Body.Close()
@@ -214,30 +241,78 @@ func configFingerprint() string {
 	return fmt.Sprintf("%x", h[:16])
 }
 
+// findDatedDumpURL attempts to find a dated dump URL by rolling back from today.
+// It tries up to dumpDateLookback days in the past and returns the most recent
+// available dump. It returns the URL, extracted date, and whether it's stale
+// (older than dumpStaleThreshold). If no dated dump is found, it returns
+// empty strings.
+func (s *Seeder) findDatedDumpURL(ctx context.Context) (url, dateStr string, stale bool) {
+	now := time.Now().UTC()
+	// Try going back up to dumpDateLookbackDays days, one day at a time
+	for daysBack := 0; daysBack <= dumpDateLookbackDays; daysBack++ {
+		date := now.AddDate(0, 0, -daysBack)
+		dateStr := date.Format("20060102")
+		url := fmt.Sprintf(dumpDatePathPattern, dateStr, dateStr) + string(s.dumpFormat)
+
+		// Try a HEAD request to check if this date exists
+		req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+		if err != nil {
+			continue
+		}
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			slog.Debug("dated dump check failed", "date", dateStr, "error", err)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			// Found a valid dated dump
+			age := now.Sub(date)
+			ageDays := int(age.Hours() / 24)
+			if age > dumpStaleThreshold {
+				slog.Warn("dated dump is older than threshold", "age_days", ageDays, "threshold", dumpStaleThreshold, "date", dateStr)
+				return url, dateStr, true
+			}
+			slog.Info("found recent dated dump", "date", dateStr, "age_days", ageDays)
+			return url, dateStr, false
+		}
+
+		slog.Debug("dated dump not found", "date", dateStr, "status", resp.StatusCode)
+	}
+
+	slog.Error("no dated dump found within lookback window", "lookback_days", dumpDateLookbackDays)
+	return "", "", false
+}
+
 // Seeder handles bulk import by streaming a Wikidata JSON dump.
 type Seeder struct {
-	writer     *store.Writer
-	httpClient *http.Client
-	dumpURL    string
-	dumpFormat DumpFormat
+	writer      *store.Writer
+	reader      *store.Reader
+	httpClient  *http.Client
+	dumpFormat  DumpFormat
+	dumpLocator func(ctx context.Context) (url, dateStr string, stale bool)
 }
 
 // NewSeeder creates a new Seeder. The format parameter selects the
 // compression format (DumpFormatGZ or DumpFormatBZ2). An empty value
 // defaults to gz.
-func NewSeeder(writer *store.Writer, httpClient *http.Client, format DumpFormat) *Seeder {
+func NewSeeder(writer *store.Writer, reader *store.Reader, httpClient *http.Client, format DumpFormat) *Seeder {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 0}
 	}
 	if format == "" {
 		format = DumpFormatGZ
 	}
-	return &Seeder{
+	seeder := &Seeder{
 		writer:     writer,
+		reader:     reader,
 		httpClient: httpClient,
-		dumpURL:    dumpBaseURL + string(format),
 		dumpFormat: format,
 	}
+	seeder.dumpLocator = seeder.findDatedDumpURL
+	return seeder
 }
 
 // newDecompressor returns a reader that decompresses data from r
@@ -255,7 +330,7 @@ func (s *Seeder) newDecompressor(r io.Reader) (io.Reader, error) {
 
 // NeedsSeed determines whether the database needs seeding.
 func (s *Seeder) NeedsSeed() (bool, error) {
-	dumpTime, err := s.writer.GetSyncState("dump_time")
+	dumpTime, err := s.reader.GetSyncState("dump_time")
 	if err != nil {
 		return false, err
 	}
@@ -263,12 +338,12 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 		return true, nil
 	}
 
-	storedHash, err := s.writer.GetSyncState("config_hash")
+	storedHash, err := s.reader.GetSyncState("config_hash")
 	if err != nil {
 		return false, err
 	}
 	if storedHash != configFingerprint() {
-		log.Println("Seed configuration has changed, reseed required")
+		slog.Info("seed configuration changed, reseed required")
 		return true, nil
 	}
 
@@ -276,74 +351,54 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 }
 
 // Seed performs a bulk import by streaming the Wikidata JSON dump.
+// It flushes the database first and imports into a clean state.
 // It respects ctx cancellation so the process can shut down promptly.
 func (s *Seeder) Seed(ctx context.Context) error {
-	// Check for resumable seed: if a previous seed was interrupted we can
-	// skip already-processed lines when the ETag still matches.
-	var skipLines int
-	prevState, _ := s.writer.GetSyncState("state")
-	if prevState == "seeding" {
-		storedEtag, _ := s.writer.GetSyncState("seed_etag")
-		lineStr, _ := s.writer.GetSyncState("seed_line")
-		if storedEtag != "" && lineStr != "" {
-			if n, err := strconv.Atoi(lineStr); err == nil && n > 0 {
-				skipLines = n
-			}
-		}
+	locator := s.dumpLocator
+	if locator == nil {
+		locator = s.findDatedDumpURL
 	}
 
-	log.Printf("Starting seed from Wikidata dump: %s", s.dumpURL)
+	// Find a dated dump URL with an actual generation date in the path.
+	// This is required—no fallback to latest or Last-Modified headers.
+	dumpURL, dateStr, stale := locator(ctx)
+	if dumpURL == "" {
+		return fmt.Errorf("no dated dump found within %d day lookback", dumpDateLookbackDays)
+	}
+	if stale {
+		slog.Warn("using stale dated dump, will continue anyway", "date", dateStr)
+	}
+
+	slog.Info("starting seed from wikidata dump", "url", dumpURL, "date", dateStr)
 
 	seedStart := time.Now()
 
-	resp, err := s.openDumpStream(ctx)
+	resp, err := s.openDumpStream(ctx, dumpURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	etag := resp.Header.Get("ETag")
+	slog.Info("flushing database before seed")
+	if err := s.writer.FlushDataContext(ctx); err != nil {
+		return fmt.Errorf("flush data: %w", err)
+	}
 
-	// Decide whether to resume or restart.
-	if skipLines > 0 && etag != "" {
-		storedEtag, _ := s.writer.GetSyncState("seed_etag")
-		if etag == storedEtag {
-			log.Printf("Resuming seed from line %d (ETag matches: %s)", skipLines, etag)
-		} else {
-			log.Printf("Cannot resume seed: ETag mismatch (stored=%s, current=%s), restarting", storedEtag, etag)
-			skipLines = 0
-		}
+	p := s.writer.NewPipe(ctx)
+	p.SetSyncState("config_hash", configFingerprint())
+	p.SetSyncState("state", "seeding")
+	if err := p.Exec(); err != nil {
+		return fmt.Errorf("set seed state: %w", err)
+	}
+
+	// Convert YYYYMMDD to RFC3339
+	var syncTime string
+	if t, err := time.Parse("20060102", dateStr); err == nil {
+		syncTime = t.UTC().Format(time.RFC3339)
 	} else {
-		skipLines = 0
+		return fmt.Errorf("parse dump date %q: %w", dateStr, err)
 	}
-
-	if skipLines == 0 {
-		if err := s.writer.ClearSyncCursors(); err != nil {
-			return err
-		}
-		if err := s.writer.SetSyncState("config_hash", configFingerprint()); err != nil {
-			return fmt.Errorf("set config hash: %w", err)
-		}
-	}
-
-	if err := s.writer.SetSyncState("state", "seeding"); err != nil {
-		return fmt.Errorf("set state: %w", err)
-	}
-	if etag != "" {
-		if err := s.writer.SetSyncState("seed_etag", etag); err != nil {
-			return fmt.Errorf("set seed_etag: %w", err)
-		}
-	}
-
-	syncTime := parseDumpTime(resp.Header.Get("Last-Modified"))
-	log.Printf("Dump Last-Modified: %s → dump_time: %s",
-		resp.Header.Get("Last-Modified"), syncTime)
-
-	// Parse the dump time as a time.Time so we can use it for viewed_at.
-	dumpTimeT, err := time.Parse(time.RFC3339, syncTime)
-	if err != nil {
-		return fmt.Errorf("parse dump time %q: %w", syncTime, err)
-	}
+	slog.Info("dump date from URL", "dump_time", syncTime)
 
 	counter := &countingReader{r: resp.Body}
 
@@ -399,40 +454,23 @@ func (s *Seeder) Seed(ctx context.Context) error {
 	}()
 
 	decompReader := &chanReader{ch: chunks, errCh: errCh, pool: chunkPool}
-	imported, lines, err := s.processDumpStream(ctx, decompReader, resp.ContentLength, counter, dumpTimeT, skipLines)
+	imported, lines, err := s.processDumpStream(ctx, decompReader, resp.ContentLength, counter)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Sweeping stale entities not present in dump...")
-	swept, err := s.writer.SweepStaleEntities(dumpTimeT.Unix())
-	if err != nil {
-		return fmt.Errorf("sweep stale entities: %w", err)
-	}
-	log.Printf("Swept %d stale entities not present in dump", swept)
-
-	if err := s.writer.SetSyncState("dump_time", syncTime); err != nil {
+	p = s.writer.NewPipe(ctx)
+	p.SetSyncState("dump_time", syncTime)
+	if err := p.Exec(); err != nil {
 		return fmt.Errorf("set dump_time: %w", err)
 	}
 
-	log.Printf("Dump seed complete: %d entities imported, %d stale entities swept from %d lines in %s",
-		imported, swept, lines, time.Since(seedStart).Truncate(time.Second))
+	slog.Info("dump seed complete", "imported", imported, "lines", lines, "elapsed", time.Since(seedStart).Truncate(time.Second))
 	return nil
 }
 
-// parseDumpTime parses the Last-Modified header and returns it as an RFC3339
-// timestamp. Falls back to the current time if the header is missing.
-func parseDumpTime(lastModified string) string {
-	if lastModified != "" {
-		if t, err := http.ParseTime(lastModified); err == nil {
-			return t.UTC().Format(time.RFC3339)
-		}
-	}
-	return time.Now().UTC().Format(time.RFC3339)
-}
-
-func (s *Seeder) openDumpStream(ctx context.Context) (*http.Response, error) {
-	req, err := newRequestWithContext(ctx, "GET", s.dumpURL)
+func (s *Seeder) openDumpStream(ctx context.Context, dumpURL string) (*http.Response, error) {
+	req, err := newRequestWithContext(ctx, "GET", dumpURL)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -452,26 +490,22 @@ func (s *Seeder) openDumpStream(ctx context.Context) (*http.Response, error) {
 	// This enables transparent reconnection via Range requests on network drops.
 	etag := resp.Header.Get("ETag")
 	if etag != "" {
-		log.Printf("Dump ETag: %s (resumable download enabled)", etag)
-		resp.Body = newResumableBody(resp.Body, s.dumpURL, etag, s.httpClient)
+		slog.Info("dump etag, resumable download enabled", "etag", strings.Trim(etag, "\""))
+		resp.Body = newResumableBody(ctx, resp.Body, dumpURL, etag, s.httpClient)
 	} else {
-		log.Println("No ETag in response; resumable download disabled")
+		slog.Info("no etag in response, resumable download disabled")
 	}
 
 	return resp, nil
 }
 
-// seedItem wraps an entity record with its source line number for seed
-// recovery tracking. This keeps line tracking out of the store layer.
-type seedItem struct {
-	store.EntityRecord
-	line int
-}
-
 // processDumpStream reads decompressed JSON lines from r and upserts
 // relevant entities. It uses a background goroutine to write to the DB
 // while parsing continues, overlapping I/O with CPU work.
-func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompressed int64, counter *countingReader, dumpTime time.Time, skipLines int) (int, int, error) {
+func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompressed int64, counter *countingReader) (int, int, error) {
+	writeCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, dumpScannerBufSize), dumpScannerBufSize)
 
@@ -479,46 +513,54 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 	started := time.Now()
 	lastLog := started
 
-	if skipLines > 0 {
-		log.Printf("Skipping %d already-processed lines...", skipLines)
-	}
-
 	// Channel for sending entities to background writer
-	entityCh := make(chan seedItem, 10000)
+	entityCh := make(chan store.EntityRecord, 10000)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// Background writer: receives entities, batches them, writes to DB
+	// Background writer: receives entities, batches them, writes to DB.
+	// On persistent failure (after retries), it cancels the pipeline with the
+	// underlying error so the producer stops cleanly.
 	go func() {
 		defer wg.Done()
 
 		batch := make([]store.EntityRecord, 0, dumpBatchSize)
-		maxLine := 0
 		flush := func() error {
 			if len(batch) == 0 {
 				return nil
 			}
-			if err := s.writer.SeedEntitiesBatch(dumpTime, batch); err != nil {
-				return err
-			}
-			// Persist the max line number in this batch for seed recovery.
-			if maxLine > 0 {
-				if err := s.writer.SetSyncState("seed_line", strconv.Itoa(maxLine)); err != nil {
+			var err error
+			for attempt := 0; attempt < dumpWriteMaxRetries; attempt++ {
+				if attempt > 0 {
+					delay := dumpWriteRetryDelay(attempt)
+					slog.Warn("retrying seed batch write", "attempt", attempt+1, "delay", delay, "error", err)
+					if err := waitForContext(writeCtx, delay); err != nil {
+						return err
+					}
+				}
+				p := s.writer.NewPipe(writeCtx)
+				for _, rec := range batch {
+					p.UpsertEntity(rec)
+				}
+				err = p.Exec()
+				if err == nil {
+					batch = batch[:0]
+					return nil
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return err
 				}
 			}
-			batch = batch[:0]
-			maxLine = 0
-			return nil
+			return fmt.Errorf("after %d attempts: %w", dumpWriteMaxRetries, err)
 		}
 
 		for item := range entityCh {
-			batch = append(batch, item.EntityRecord)
-			maxLine = max(maxLine, item.line)
+			batch = append(batch, item)
 			if len(batch) >= dumpBatchSize {
 				if err := flush(); err != nil {
-					log.Printf("Error in background writer: %v", err)
+					slog.Error("background writer error", "error", err)
+					cancel(fmt.Errorf("background writer: %w", err))
 					return
 				}
 			}
@@ -526,7 +568,8 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 
 		// Flush remaining
 		if err := flush(); err != nil {
-			log.Printf("Error in background writer final flush: %v", err)
+			slog.Error("background writer final flush error", "error", err)
+			cancel(fmt.Errorf("background writer: %w", err))
 		}
 	}()
 
@@ -540,46 +583,51 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 			return imported, lines, ctx.Err()
 		default:
 		}
+		if err := context.Cause(writeCtx); err != nil && ctx.Err() == nil {
+			close(entityCh)
+			wg.Wait()
+			return imported, lines, err
+		}
 		line := scanner.Bytes()
 		lines++
 
-		// Skip lines already processed in a previous run.
-		if lines <= skipLines {
-			if now := time.Now(); now.Sub(lastLog) >= dumpProgressInterval {
-				rate := float64(lines) / now.Sub(started).Seconds()
-				log.Printf("  skip progress: %d/%d lines skipped (%.0f lines/sec)",
-					lines, skipLines, rate)
-				lastLog = now
-			}
-			continue
-		}
-
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 || line[0] == '[' || line[0] == ']' {
+			continue
+		}
+		if len(line) > dumpMaxLineSize {
+			slog.Warn("skipping oversized line", "line", lines, "size", len(line), "max_size", dumpMaxLineSize)
 			continue
 		}
 		if line[len(line)-1] == ',' {
 			line = line[:len(line)-1]
 		}
 
-		entity, err := parseDumpEntity(line)
+		entity, err := ParseEntityJSON(line)
 		if err != nil {
-			if lines <= 5 {
-				log.Printf("Warning: failed to parse dump line %d: %v", lines, err)
-			}
+			slog.Warn("failed to parse dump line", "line", lines, "error", err)
 			continue
 		}
 		if entity == nil {
 			continue
 		}
 
-		entityCh <- seedItem{
-			EntityRecord: store.EntityRecord{
-				WikidataID:  entity.ID,
-				ExternalIDs: entity.ExternalIDs,
-				Modified:    entity.Modified,
-			},
-			line: lines,
+		select {
+		case entityCh <- store.EntityRecord{
+			WikidataID: entity.ID,
+			Mappings:   entity.Mappings,
+		}:
+		case <-writeCtx.Done():
+			close(entityCh)
+			wg.Wait()
+			if err := ctx.Err(); err != nil {
+				return imported, lines, err
+			}
+			return imported, lines, context.Cause(writeCtx)
+		case <-ctx.Done():
+			close(entityCh)
+			wg.Wait()
+			return imported, lines, ctx.Err()
 		}
 		imported++
 
@@ -587,11 +635,9 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 			rate := float64(lines) / now.Sub(started).Seconds()
 			if totalCompressed > 0 && counter != nil {
 				pct := float64(counter.bytes.Load()) / float64(totalCompressed) * 100
-				log.Printf("  dump progress: %.1f%% | %d lines processed, %d entities imported (%.0f lines/sec)",
-					pct, lines, imported, rate)
+				slog.Info("dump progress", "percent", fmt.Sprintf("%.2f", pct), "lines", lines, "imported", imported, "rate", fmt.Sprintf("%.2f", rate))
 			} else {
-				log.Printf("  dump progress: %d lines processed, %d entities imported (%.0f lines/sec)",
-					lines, imported, rate)
+				slog.Info("dump progress", "lines", lines, "imported", imported, "rate", fmt.Sprintf("%.2f", rate))
 			}
 			lastLog = now
 		}
@@ -601,9 +647,38 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 	close(entityCh)
 	wg.Wait()
 
+	if err := ctx.Err(); err != nil {
+		return imported, lines, err
+	}
+
+	if err := context.Cause(writeCtx); err != nil && ctx.Err() == nil {
+		return imported, lines, err
+	}
+
 	if err := scanner.Err(); err != nil {
 		return imported, lines, fmt.Errorf("scanner error at line %d: %w", lines, err)
 	}
 
 	return imported, lines, nil
+}
+
+func waitForContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

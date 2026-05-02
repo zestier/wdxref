@@ -2,7 +2,7 @@ package watcher
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -50,7 +50,7 @@ const (
 	wikimediaBurst              = 1               // max concurrent requests (unauthenticated)
 	wikimediaExpensiveThreshold = 1 * time.Second // response time that triggers cooldown
 	wikimediaExpensiveCooldown  = 5 * time.Second // wait after an expensive response
-	wikimediaMaxlag             = 5               // seconds; lower = more generous to Wikimedia servers
+	wikimediaMaxlag             = 5.0             // seconds; lower = more generous to Wikimedia servers
 )
 
 // ThrottleTransport is an http.RoundTripper that enforces Wikimedia robot
@@ -61,6 +61,9 @@ type ThrottleTransport struct {
 	mu      sync.Mutex
 	limiter *rate.Limiter
 	base    http.RoundTripper
+
+	expensiveThreshold time.Duration
+	expensiveCooldown  time.Duration
 }
 
 // NewThrottleTransport creates a ThrottleTransport configured for
@@ -71,8 +74,10 @@ func NewThrottleTransport(base http.RoundTripper) *ThrottleTransport {
 		base = http.DefaultTransport
 	}
 	return &ThrottleTransport{
-		limiter: rate.NewLimiter(rate.Limit(wikimediaRateLimit), wikimediaBurst),
-		base:    base,
+		limiter:            rate.NewLimiter(rate.Limit(wikimediaRateLimit), wikimediaBurst),
+		base:               base,
+		expensiveThreshold: wikimediaExpensiveThreshold,
+		expensiveCooldown:  wikimediaExpensiveCooldown,
 	}
 }
 
@@ -96,12 +101,20 @@ func (t *ThrottleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return nil, err
 	}
 
-	if elapsed > wikimediaExpensiveThreshold {
-		log.Printf("Wikimedia request took %v (>%v), applying %v cooldown",
-			elapsed.Truncate(time.Millisecond), wikimediaExpensiveThreshold, wikimediaExpensiveCooldown)
+	threshold := t.expensiveThreshold
+	if threshold <= 0 {
+		threshold = wikimediaExpensiveThreshold
+	}
+	cooldown := t.expensiveCooldown
+	if cooldown <= 0 {
+		cooldown = wikimediaExpensiveCooldown
+	}
+
+	if elapsed > threshold {
+		slog.Warn("wikimedia request slow, applying cooldown", "elapsed", elapsed.Truncate(time.Millisecond), "threshold", threshold, "cooldown", cooldown)
 		select {
 		case <-ctx.Done():
-		case <-time.After(wikimediaExpensiveCooldown):
+		case <-time.After(cooldown):
 		}
 	}
 

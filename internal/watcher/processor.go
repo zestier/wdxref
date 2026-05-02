@@ -1,8 +1,9 @@
 package watcher
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/ekeid/ekeid/internal/store"
 )
@@ -67,58 +68,37 @@ func (p *Processor) ProcessEntities(qids []string) (map[string]error, error) {
 			continue
 		}
 
-		entity, parseErr := ParseEntityJSON(qid, result.Data)
+		entity, parseErr := ParseEntityJSON(result.Data)
 		if parseErr != nil {
 			perEntityErrors[qid] = fmt.Errorf("parse entity %s: %w", qid, parseErr)
 			errored++
 			continue
 		}
-
 		if entity == nil {
-			deletes = append(deletes, qid)
+			// Non-Q entity (property, lexeme) — skip silently.
 			continue
 		}
 
 		upserts = append(upserts, store.EntityRecord{
-			WikidataID:  entity.ID,
-			ExternalIDs: entity.ExternalIDs,
-			Modified:    entity.Modified,
+			WikidataID: qid,
+			Mappings:   entity.Mappings,
 		})
 	}
 
-	if len(upserts) > 0 {
-		if err := p.writer.UpsertEntitiesBatch(upserts); err != nil {
-			return nil, fmt.Errorf("batch upsert: %w", err)
+	if len(upserts) > 0 || len(deletes) > 0 {
+		pipe := p.writer.NewPipe(context.Background())
+		for _, rec := range upserts {
+			pipe.UpsertEntity(rec)
+		}
+		for _, qid := range deletes {
+			pipe.DeleteEntity(qid)
+		}
+		if err := pipe.Exec(); err != nil {
+			return nil, fmt.Errorf("batch write: %w", err)
 		}
 	}
 
-	if len(deletes) > 0 {
-		if err := p.writer.DeleteEntitiesBatch(deletes); err != nil {
-			return nil, fmt.Errorf("batch delete: %w", err)
-		}
-	}
-
-	log.Printf("Batch processed %d entities: %d upserted, %d deleted, %d errors",
-		len(qids), len(upserts), len(deletes), errored)
+	slog.Info("batch processed", "total", len(qids), "upserted", len(upserts), "deleted", len(deletes), "errors", errored)
 
 	return perEntityErrors, nil
-}
-
-// ProcessEntityFromJSON processes a pre-fetched entity JSON directly.
-// Used during seeding to avoid redundant HTTP fetches.
-func (p *Processor) ProcessEntityFromJSON(qid string, data []byte) error {
-	entity, err := ParseEntityJSON(qid, data)
-	if err != nil {
-		return fmt.Errorf("parse entity %s: %w", qid, err)
-	}
-
-	if entity == nil {
-		return nil // Not relevant
-	}
-
-	if err := p.writer.UpsertEntity(entity.ID, entity.ExternalIDs); err != nil {
-		return fmt.Errorf("upsert entity %s: %w", qid, err)
-	}
-
-	return nil
 }

@@ -1,43 +1,64 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/goccy/go-json"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/ekeid/ekeid/internal/store"
 )
 
 func setupTestServer(t *testing.T) (*Server, *store.Writer) {
 	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	w, err := store.NewWriter(dbPath)
+	s := miniredis.RunT(t)
+	c, err := store.NewClient(s.Addr())
 	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
+	t.Cleanup(func() { c.Close() })
+
+	w := store.NewWriter(c)
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
-	t.Cleanup(func() { w.Close() })
 
-	r := store.NewReaderFromDB(w.DB())
+	r := store.NewReader(c)
 	srv := NewServer(r, "0.1.0-test", nil)
 	return srv, w
 }
 
+// testUpsertEntity is a test helper that wraps Pipe for convenience.
+func testUpsertEntity(t *testing.T, w *store.Writer, wikidataID string, mappings []string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.UpsertEntity(store.EntityRecord{WikidataID: wikidataID, Mappings: mappings})
+	if err := p.Exec(); err != nil {
+		t.Fatalf("UpsertEntity(%s): %v", wikidataID, err)
+	}
+}
+
+// testSetSyncState is a test helper that wraps Pipe for convenience.
+func testSetSyncState(t *testing.T, w *store.Writer, key, value string) {
+	t.Helper()
+	p := w.NewPipe(context.Background())
+	p.SetSyncState(key, value)
+	if err := p.Exec(); err != nil {
+		t.Fatalf("SetSyncState(%s): %v", key, err)
+	}
+}
+
 func TestLookupSuccess(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", map[int][]string{
-		345:  {"tt0111161"},
-		4947: {"278"},
-		4835: {"2095"},
-		8013: {"the-shawshank-redemption"},
-	})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161", "P4947:278", "P4835:2095", "P8013:the-shawshank-redemption"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt0111161", nil)
 	rec := httptest.NewRecorder()
@@ -47,19 +68,22 @@ func TestLookupSuccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp lookupResponse
+	var resp []lookupResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 
-	if resp.WikidataID != "Q172241" {
-		t.Errorf("WikidataID = %q, want %q", resp.WikidataID, "Q172241")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp))
 	}
-	if v := resp.Mappings["P345"]; len(v) != 1 || v[0] != "tt0111161" {
-		t.Errorf("Mappings[P345] = %v, want [tt0111161]", resp.Mappings["P345"])
+	if resp[0].WikidataID != "Q172241" {
+		t.Errorf("WikidataID = %q, want %q", resp[0].WikidataID, "Q172241")
 	}
-	if v := resp.Mappings["P4947"]; len(v) != 1 || v[0] != "278" {
-		t.Errorf("Mappings[P4947] = %v, want [278]", resp.Mappings["P4947"])
+	if !slices.Contains(resp[0].Mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp[0].Mappings)
+	}
+	if !slices.Contains(resp[0].Mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", resp[0].Mappings)
 	}
 
 	cc := rec.Header().Get("Cache-Control")
@@ -80,16 +104,16 @@ func TestLookupNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	var resp errorResponse
+	var resp []lookupResponse
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Error != "not_found" {
-		t.Errorf("Error = %q, want %q", resp.Error, "not_found")
+	if len(resp) != 0 {
+		t.Errorf("expected empty array, got %+v", resp)
 	}
 }
 
@@ -128,10 +152,7 @@ func TestLookupInvalidProperty(t *testing.T) {
 
 func TestWikidataLookupSuccess(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", map[int][]string{
-		345:  {"tt0111161"},
-		4947: {"278"},
-	})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161", "P4947:278"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/Q172241", nil)
 	rec := httptest.NewRecorder()
@@ -148,8 +169,8 @@ func TestWikidataLookupSuccess(t *testing.T) {
 	if resp.WikidataID != "Q172241" {
 		t.Errorf("WikidataID = %q, want %q", resp.WikidataID, "Q172241")
 	}
-	if v := resp.Mappings["P345"]; len(v) != 1 || v[0] != "tt0111161" {
-		t.Errorf("Mappings[P345] = %v, want [tt0111161]", resp.Mappings["P345"])
+	if !slices.Contains(resp.Mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp.Mappings)
 	}
 }
 
@@ -194,8 +215,8 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	srv, w := setupTestServer(t)
 
 	// Same TMDB ID "278" for movie (P4947) and TV (P4983)
-	w.UpsertEntity("Q172241", map[int][]string{4947: {"278"}, 345: {"tt0111161"}})
-	w.UpsertEntity("Q999999", map[int][]string{4983: {"278"}, 345: {"tt9999999"}})
+	testUpsertEntity(t, w, "Q172241", []string{"P4947:278", "P345:tt0111161"})
+	testUpsertEntity(t, w, "Q999999", []string{"P4983:278", "P345:tt9999999"})
 
 	req := httptest.NewRequest("GET", "/v1/lookup/P4947/278", nil)
 	rec := httptest.NewRecorder()
@@ -204,10 +225,10 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4947 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var movieResp lookupResponse
+	var movieResp []lookupResponse
 	json.NewDecoder(rec.Body).Decode(&movieResp)
-	if movieResp.WikidataID != "Q172241" {
-		t.Errorf("P4947 WikidataID = %q, want Q172241", movieResp.WikidataID)
+	if len(movieResp) != 1 || movieResp[0].WikidataID != "Q172241" {
+		t.Errorf("P4947 WikidataID = %+v, want Q172241", movieResp)
 	}
 
 	req = httptest.NewRequest("GET", "/v1/lookup/P4983/278", nil)
@@ -217,20 +238,58 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4983 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var tvResp lookupResponse
+	var tvResp []lookupResponse
 	json.NewDecoder(rec.Body).Decode(&tvResp)
-	if tvResp.WikidataID != "Q999999" {
-		t.Errorf("P4983 WikidataID = %q, want Q999999", tvResp.WikidataID)
+	if len(tvResp) != 1 || tvResp[0].WikidataID != "Q999999" {
+		t.Errorf("P4983 WikidataID = %+v, want Q999999", tvResp)
+	}
+}
+
+func TestLookupSharedExternalID(t *testing.T) {
+	srv, w := setupTestServer(t)
+
+	// Two entities claim the same IMDb ID.
+	testUpsertEntity(t, w, "Q100", []string{"P345:tt1234567", "P4947:100"})
+	testUpsertEntity(t, w, "Q200", []string{"P345:tt1234567", "P4947:200"})
+
+	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt1234567", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp []lookupResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp) != 2 {
+		t.Fatalf("expected 2 results, got %d: %+v", len(resp), resp)
+	}
+
+	// Results should be sorted lexicographically by entity ID.
+	ids := []string{resp[0].WikidataID, resp[1].WikidataID}
+	if ids[0] != "Q100" || ids[1] != "Q200" {
+		t.Errorf("wikidata_ids = %v, want [Q100, Q200]", ids)
+	}
+
+	// Each result should carry its own mappings.
+	if !slices.Contains(resp[0].Mappings, "P4947:100") {
+		t.Errorf("Q100 mappings = %v, want P4947:100", resp[0].Mappings)
+	}
+	if !slices.Contains(resp[1].Mappings, "P4947:200") {
+		t.Errorf("Q200 mappings = %v, want P4947:200", resp[1].Mappings)
 	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", map[int][]string{345: {"tt0000001"}, 4947: {"1"}})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
-	w.SetSyncState("state", "streaming")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
 
 	req := httptest.NewRequest("GET", "/v1/health", nil)
 	rec := httptest.NewRecorder()
@@ -259,9 +318,6 @@ func TestHealthEndpoint(t *testing.T) {
 	if resp.State != "streaming" {
 		t.Errorf("State = %q, want %q", resp.State, "streaming")
 	}
-	if resp.DatabaseSize <= 0 {
-		t.Errorf("DatabaseSize = %d, want > 0", resp.DatabaseSize)
-	}
 
 	cc := rec.Header().Get("Cache-Control")
 	if cc != "no-cache" {
@@ -272,10 +328,11 @@ func TestHealthEndpoint(t *testing.T) {
 func TestStatsEndpoint(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", map[int][]string{345: {"tt0000001"}, 4947: {"1"}})
-	w.SetSyncState("dump_time", "2026-03-01T00:00:00Z")
-	w.SetSyncState("last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
-	w.SetSyncState("state", "streaming")
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt0000002", "P4947:2"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
 
 	req := httptest.NewRequest("GET", "/v1/stats", nil)
 	rec := httptest.NewRecorder()
@@ -289,17 +346,98 @@ func TestStatsEndpoint(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.MappingCount != 2 {
-		t.Errorf("MappingCount = %d, want 2", resp.MappingCount)
+	if resp.Status != "ok" {
+		t.Errorf("Status = %q, want %q", resp.Status, "ok")
+	}
+	if resp.Version != "0.1.0-test" {
+		t.Errorf("Version = %q, want %q", resp.Version, "0.1.0-test")
 	}
 	if resp.DumpTime != "2026-03-01T00:00:00Z" {
 		t.Errorf("DumpTime = %q, want %q", resp.DumpTime, "2026-03-01T00:00:00Z")
+	}
+	if resp.LastEventID != `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]` {
+		t.Errorf("LastEventID = %q, want raw event ID", resp.LastEventID)
 	}
 	if resp.LastEventSync != "2026-03-10T14:22:00Z" {
 		t.Errorf("LastEventSync = %q, want %q", resp.LastEventSync, "2026-03-10T14:22:00Z")
 	}
 	if resp.State != "streaming" {
 		t.Errorf("State = %q, want %q", resp.State, "streaming")
+	}
+	if !resp.SchemaMatch {
+		t.Error("SchemaMatch should be true")
+	}
+	if resp.StreamLength != 2 {
+		t.Errorf("StreamLength = %d, want 2", resp.StreamLength)
+	}
+	if resp.PendingCount != 0 {
+		t.Errorf("PendingCount = %d, want 0", resp.PendingCount)
+	}
+	if resp.ProcessingCount != 0 {
+		t.Errorf("ProcessingCount = %d, want 0", resp.ProcessingCount)
+	}
+	if resp.FailedCount != 0 {
+		t.Errorf("FailedCount = %d, want 0", resp.FailedCount)
+	}
+	if resp.OldestEvent == "" {
+		t.Error("OldestEvent should not be empty")
+	}
+	if resp.NewestEvent == "" {
+		t.Error("NewestEvent should not be empty")
+	}
+}
+
+func TestStatsSharesHealthFields(t *testing.T) {
+	srv, w := setupTestServer(t)
+
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt0000001", "P4947:1"})
+	testSetSyncState(t, w, "dump_time", "2026-03-01T00:00:00Z")
+	testSetSyncState(t, w, "last_event_id", `[{"topic":"eqiad.mediawiki.recentchange","partition":0,"timestamp":1773152520000}]`)
+	testSetSyncState(t, w, "state", "streaming")
+
+	healthReq := httptest.NewRequest("GET", "/v1/health", nil)
+	healthRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(healthRec, healthReq)
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", healthRec.Code, http.StatusOK)
+	}
+
+	statsReq := httptest.NewRequest("GET", "/v1/stats", nil)
+	statsRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(statsRec, statsReq)
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("stats status = %d, want %d", statsRec.Code, http.StatusOK)
+	}
+
+	var health healthResponse
+	if err := json.NewDecoder(healthRec.Body).Decode(&health); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	var stats statsResponse
+	if err := json.NewDecoder(statsRec.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+
+	if stats.Status != health.Status {
+		t.Errorf("Status = %q, want %q", stats.Status, health.Status)
+	}
+	if stats.Version != health.Version {
+		t.Errorf("Version = %q, want %q", stats.Version, health.Version)
+	}
+	if stats.State != health.State {
+		t.Errorf("State = %q, want %q", stats.State, health.State)
+	}
+	if stats.DumpTime != health.DumpTime {
+		t.Errorf("DumpTime = %q, want %q", stats.DumpTime, health.DumpTime)
+	}
+	if stats.LastEventSync != health.LastEventSync {
+		t.Errorf("LastEventSync = %q, want %q", stats.LastEventSync, health.LastEventSync)
+	}
+	if stats.DatabaseSize != health.DatabaseSize {
+		t.Errorf("DatabaseSize = %d, want %d", stats.DatabaseSize, health.DatabaseSize)
+	}
+	if stats.SchemaMatch != health.SchemaMatch {
+		t.Errorf("SchemaMatch = %t, want %t", stats.SchemaMatch, health.SchemaMatch)
 	}
 }
 
@@ -330,6 +468,95 @@ func TestCORSPreflight(t *testing.T) {
 	}
 	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Error("missing CORS headers on preflight")
+	}
+}
+
+func TestHealthCompressionGzip(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("Vary = %q, want Accept-Encoding", got)
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	var resp healthResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("Status = %q, want ok", resp.Status)
+	}
+}
+
+func TestHealthCompressionZstd(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "zstd")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", got)
+	}
+
+	zr, err := zstd.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("zstd.NewReader: %v", err)
+	}
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	var resp healthResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("Status = %q, want ok", resp.Status)
+	}
+}
+
+func TestHealthCompressionPrefersZstdOverGzip(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", got)
 	}
 }
 
@@ -375,7 +602,7 @@ func TestHealthSchemaMatchTrue(t *testing.T) {
 
 func TestLookupCaseInsensitiveProperty(t *testing.T) {
 	srv, w := setupTestServer(t)
-	w.UpsertEntity("Q172241", map[int][]string{345: {"tt0111161"}})
+	testUpsertEntity(t, w, "Q172241", []string{"P345:tt0111161"})
 
 	// Lowercase "p" should also work
 	req := httptest.NewRequest("GET", "/v1/lookup/p345/tt0111161", nil)
@@ -387,321 +614,28 @@ func TestLookupCaseInsensitiveProperty(t *testing.T) {
 	}
 }
 
-// --- Rate limiting tests ---
-
-func setupRateLimitedServer(t *testing.T, rate float64, burst int) (*Server, *store.Writer, *RateLimiter) {
-	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-	w, err := store.NewWriter(dbPath)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	if err := w.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema: %v", err)
-	}
-	t.Cleanup(func() { w.Close() })
-	r := store.NewReaderFromDB(w.DB())
-	rl := NewRateLimiter(rate, burst)
-	t.Cleanup(func() { rl.Stop() })
-	srv := NewServer(r, "0.1.0-test", rl)
-	return srv, w, rl
-}
-
-func TestRateLimitBurstAllowed(t *testing.T) {
-	srv, _, _ := setupRateLimitedServer(t, 1, 3)
-	handler := srv.Handler()
-
-	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest("GET", "/v1/health", nil)
-		req.RemoteAddr = "10.0.0.1:12345"
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("request %d: status = %d, want %d", i+1, rec.Code, http.StatusOK)
-		}
-		if rec.Header().Get("X-RateLimit-Limit") != "3" {
-			t.Errorf("request %d: X-RateLimit-Limit = %q, want %q", i+1, rec.Header().Get("X-RateLimit-Limit"), "3")
-		}
-		if rec.Header().Get("X-RateLimit-Remaining") == "" {
-			t.Errorf("request %d: X-RateLimit-Remaining header missing", i+1)
-		}
-		if rec.Header().Get("X-RateLimit-Reset") == "" {
-			t.Errorf("request %d: X-RateLimit-Reset header missing", i+1)
-		}
-	}
-}
-
-func TestRateLimitExceeded(t *testing.T) {
-	srv, _, _ := setupRateLimitedServer(t, 1, 2)
-	handler := srv.Handler()
-
-	// Exhaust the burst
-	for i := 0; i < 2; i++ {
-		req := httptest.NewRequest("GET", "/v1/health", nil)
-		req.RemoteAddr = "10.0.0.1:12345"
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("request %d: status = %d, want %d", i+1, rec.Code, http.StatusOK)
-		}
-	}
-
-	// Third request should be rate limited
-	req := httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusTooManyRequests, rec.Body.String())
-	}
-
-	var errResp errorResponse
-	if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode 429 body: %v", err)
-	}
-	if errResp.Error != "rate_limit_exceeded" {
-		t.Errorf("Error = %q, want %q", errResp.Error, "rate_limit_exceeded")
-	}
-	if errResp.Message == "" {
-		t.Error("expected non-empty message on 429 response")
-	}
-	if rec.Header().Get("Retry-After") == "" {
-		t.Error("missing Retry-After header on 429 response")
-	}
-}
-
-func TestRateLimitHeaders(t *testing.T) {
-	srv, _, _ := setupRateLimitedServer(t, 1, 3)
-	handler := srv.Handler()
-
-	// First request: remaining should be 2 (burst=3, minus 1)
-	req := httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if got := rec.Header().Get("X-RateLimit-Limit"); got != "3" {
-		t.Errorf("X-RateLimit-Limit = %q, want %q", got, "3")
-	}
-	if got := rec.Header().Get("X-RateLimit-Remaining"); got != "2" {
-		t.Errorf("X-RateLimit-Remaining = %q, want %q", got, "2")
-	}
-	if got := rec.Header().Get("X-RateLimit-Reset"); got == "" {
-		t.Error("X-RateLimit-Reset header missing")
-	}
-
-	// Second request: remaining should be 1
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if got := rec.Header().Get("X-RateLimit-Remaining"); got != "1" {
-		t.Errorf("second request: X-RateLimit-Remaining = %q, want %q", got, "1")
-	}
-
-	// Third request: remaining should be 0
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if got := rec.Header().Get("X-RateLimit-Remaining"); got != "0" {
-		t.Errorf("third request: X-RateLimit-Remaining = %q, want %q", got, "0")
-	}
-
-	// Fourth request: 429, remaining=0
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("fourth request: status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
-	if got := rec.Header().Get("X-RateLimit-Remaining"); got != "0" {
-		t.Errorf("fourth request: X-RateLimit-Remaining = %q, want %q", got, "0")
-	}
-	if got := rec.Header().Get("X-RateLimit-Limit"); got != "3" {
-		t.Errorf("fourth request: X-RateLimit-Limit = %q, want %q", got, "3")
-	}
-}
-
-func TestRateLimitPerIP(t *testing.T) {
-	srv, _, _ := setupRateLimitedServer(t, 1, 1)
-	handler := srv.Handler()
-
-	// First IP uses its burst
-	req := httptest.NewRequest("GET", "/v1/health", nil)
-	req.Header.Set("X-Forwarded-For", "1.1.1.1")
-	req.RemoteAddr = "proxy:8080"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("IP1 first request: status = %d, want %d", rec.Code, http.StatusOK)
-	}
-
-	// First IP is now exhausted
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.Header.Set("X-Forwarded-For", "1.1.1.1")
-	req.RemoteAddr = "proxy:8080"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("IP1 second request: status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
-
-	// Second IP should still have its own bucket
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.Header.Set("X-Forwarded-For", "2.2.2.2")
-	req.RemoteAddr = "proxy:8080"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("IP2 first request: status = %d, want %d. IP isolation failed", rec.Code, http.StatusOK)
-	}
-}
-
-func TestRateLimitCORS429(t *testing.T) {
-	srv, _, _ := setupRateLimitedServer(t, 1, 1)
-	handler := srv.Handler()
-
-	// Exhaust the burst
-	req := httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	// Trigger 429
-	req = httptest.NewRequest("GET", "/v1/health", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("429 response: Access-Control-Allow-Origin = %q, want %q", got, "*")
-	}
-}
-
-func TestClientIPExtraction(t *testing.T) {
-	tests := []struct {
-		name       string
-		xff        string
-		xRealIP    string
-		remoteAddr string
-		wantIP     string
-	}{
-		{
-			name:       "X-Forwarded-For single IP",
-			xff:        "203.0.113.50",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "203.0.113.50",
-		},
-		{
-			name:       "X-Forwarded-For multiple IPs uses leftmost",
-			xff:        "203.0.113.50, 70.41.3.18, 150.172.238.178",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "203.0.113.50",
-		},
-		{
-			name:       "X-Real-IP when no X-Forwarded-For",
-			xRealIP:    "198.51.100.42",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "198.51.100.42",
-		},
-		{
-			name:       "X-Forwarded-For takes precedence over X-Real-IP",
-			xff:        "203.0.113.50",
-			xRealIP:    "198.51.100.42",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "203.0.113.50",
-		},
-		{
-			name:       "RemoteAddr host:port",
-			remoteAddr: "192.168.1.1:54321",
-			wantIP:     "192.168.1.1",
-		},
-		{
-			name:       "RemoteAddr bare IP (no port)",
-			remoteAddr: "192.168.1.1",
-			wantIP:     "192.168.1.1",
-		},
-		{
-			name:       "X-Forwarded-For with spaces",
-			xff:        "  203.0.113.50  , 70.41.3.18",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "203.0.113.50",
-		},
-		{
-			name:       "X-Real-IP with spaces",
-			xRealIP:    "  198.51.100.42  ",
-			remoteAddr: "127.0.0.1:1234",
-			wantIP:     "198.51.100.42",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "/", nil)
-			req.RemoteAddr = tt.remoteAddr
-			if tt.xff != "" {
-				req.Header.Set("X-Forwarded-For", tt.xff)
-			}
-			if tt.xRealIP != "" {
-				req.Header.Set("X-Real-IP", tt.xRealIP)
-			}
-
-			got := clientIP(req)
-			if got != tt.wantIP {
-				t.Errorf("clientIP() = %q, want %q", got, tt.wantIP)
-			}
-		})
-	}
-}
-
-func TestRateLimitStopIdempotent(t *testing.T) {
-	rl := NewRateLimiter(1, 5)
-
-	// Should not panic when called multiple times
-	rl.Stop()
-	rl.Stop()
-	rl.Stop()
-}
-
 // --- Schema mismatch tests ---
 
 // setupMismatchedServer creates a server whose Reader detects a schema mismatch.
 func setupMismatchedServer(t *testing.T) *Server {
 	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	w, err := store.NewWriter(dbPath)
+	s := miniredis.RunT(t)
+	c, err := store.NewClient(s.Addr())
 	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
+	t.Cleanup(func() { c.Close() })
+
+	w := store.NewWriter(c)
 	if err := w.MigrateSchema(); err != nil {
 		t.Fatalf("MigrateSchema: %v", err)
 	}
-	w.UpsertEntity("Q1", map[int][]string{345: {"tt1"}})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
 
 	// Corrupt the schema version so the Reader sees a mismatch
-	w.SetSyncState("schema_version", "wrong-version")
-	t.Cleanup(func() { w.Close() })
+	testSetSyncState(t, w, "schema_version", "wrong-version")
 
-	r := store.NewReaderFromDB(w.DB())
+	r := store.NewReader(c)
 	return NewServer(r, "0.1.0-test", nil)
 }
 
@@ -766,8 +700,8 @@ func TestHealthSchemaMismatch(t *testing.T) {
 func TestStatsEntityCount(t *testing.T) {
 	srv, w := setupTestServer(t)
 
-	w.UpsertEntity("Q1", map[int][]string{345: {"tt1"}})
-	w.UpsertEntity("Q2", map[int][]string{345: {"tt2"}, 4947: {"100"}})
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+	testUpsertEntity(t, w, "Q2", []string{"P345:tt2", "P4947:100"})
 
 	req := httptest.NewRequest("GET", "/v1/stats", nil)
 	rec := httptest.NewRecorder()
@@ -784,7 +718,28 @@ func TestStatsEntityCount(t *testing.T) {
 	if resp.EntityCount != 2 {
 		t.Errorf("EntityCount = %d, want 2", resp.EntityCount)
 	}
-	if resp.MappingCount != 3 {
-		t.Errorf("MappingCount = %d, want 3", resp.MappingCount)
+}
+
+func TestLookupCanceledRequestReturnsGatewayTimeout(t *testing.T) {
+	srv, w := setupTestServer(t)
+	testUpsertEntity(t, w, "Q1", []string{"P345:tt1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt1", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusGatewayTimeout, rec.Body.String())
+	}
+
+	var resp errorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error != "timeout" {
+		t.Errorf("Error = %q, want %q", resp.Error, "timeout")
 	}
 }

@@ -17,6 +17,12 @@ import (
 	"github.com/ekeid/ekeid/internal/store"
 )
 
+// decodedLookup is a test-only mirror of lookupResponse that decodes the
+// raw JSON mapping arrays back into []string for assertion convenience.
+type decodedLookup struct {
+	Mappings map[string][]string `json:"mappings"`
+}
+
 func setupTestServer(t *testing.T) (*Server, *store.Writer) {
 	t.Helper()
 	s := miniredis.RunT(t)
@@ -68,22 +74,23 @@ func TestLookupSuccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp []lookupResponse
+	var resp decodedLookup
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 
-	if len(resp) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(resp))
+	if len(resp.Mappings) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp.Mappings))
 	}
-	if resp[0].WikidataID != "Q172241" {
-		t.Errorf("WikidataID = %q, want %q", resp[0].WikidataID, "Q172241")
+	mappings, ok := resp.Mappings["Q172241"]
+	if !ok {
+		t.Fatalf("expected Q172241 in mappings, got %+v", resp.Mappings)
 	}
-	if !slices.Contains(resp[0].Mappings, "P345:tt0111161") {
-		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp[0].Mappings)
+	if !slices.Contains(mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", mappings)
 	}
-	if !slices.Contains(resp[0].Mappings, "P4947:278") {
-		t.Errorf("expected P4947:278 in mappings, got %v", resp[0].Mappings)
+	if !slices.Contains(mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", mappings)
 	}
 
 	cc := rec.Header().Get("Cache-Control")
@@ -108,12 +115,12 @@ func TestLookupNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	var resp []lookupResponse
+	var resp decodedLookup
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(resp) != 0 {
-		t.Errorf("expected empty array, got %+v", resp)
+	if len(resp.Mappings) != 0 {
+		t.Errorf("expected empty mappings, got %+v", resp.Mappings)
 	}
 }
 
@@ -162,15 +169,19 @@ func TestWikidataLookupSuccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp lookupResponse
+	var resp decodedLookup
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp.WikidataID != "Q172241" {
-		t.Errorf("WikidataID = %q, want %q", resp.WikidataID, "Q172241")
+	if len(resp.Mappings) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp.Mappings))
 	}
-	if !slices.Contains(resp.Mappings, "P345:tt0111161") {
-		t.Errorf("expected P345:tt0111161 in mappings, got %v", resp.Mappings)
+	mappings, ok := resp.Mappings["Q172241"]
+	if !ok {
+		t.Fatalf("expected Q172241 in mappings, got %+v", resp.Mappings)
+	}
+	if !slices.Contains(mappings, "P345:tt0111161") {
+		t.Errorf("expected P345:tt0111161 in mappings, got %v", mappings)
 	}
 }
 
@@ -225,10 +236,12 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4947 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var movieResp []lookupResponse
+	var movieResp decodedLookup
 	json.NewDecoder(rec.Body).Decode(&movieResp)
-	if len(movieResp) != 1 || movieResp[0].WikidataID != "Q172241" {
-		t.Errorf("P4947 WikidataID = %+v, want Q172241", movieResp)
+	if len(movieResp.Mappings) != 1 {
+		t.Errorf("P4947 mappings = %+v, want single Q172241 entry", movieResp.Mappings)
+	} else if _, ok := movieResp.Mappings["Q172241"]; !ok {
+		t.Errorf("P4947 mappings = %+v, want Q172241", movieResp.Mappings)
 	}
 
 	req = httptest.NewRequest("GET", "/v1/lookup/P4983/278", nil)
@@ -238,10 +251,12 @@ func TestLookupPropertyDisambiguation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("P4983 status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var tvResp []lookupResponse
+	var tvResp decodedLookup
 	json.NewDecoder(rec.Body).Decode(&tvResp)
-	if len(tvResp) != 1 || tvResp[0].WikidataID != "Q999999" {
-		t.Errorf("P4983 WikidataID = %+v, want Q999999", tvResp)
+	if len(tvResp.Mappings) != 1 {
+		t.Errorf("P4983 mappings = %+v, want single Q999999 entry", tvResp.Mappings)
+	} else if _, ok := tvResp.Mappings["Q999999"]; !ok {
+		t.Errorf("P4983 mappings = %+v, want Q999999", tvResp.Mappings)
 	}
 }
 
@@ -260,26 +275,25 @@ func TestLookupSharedExternalID(t *testing.T) {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp []lookupResponse
+	var resp decodedLookup
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(resp) != 2 {
-		t.Fatalf("expected 2 results, got %d: %+v", len(resp), resp)
+	if len(resp.Mappings) != 2 {
+		t.Fatalf("expected 2 results, got %d: %+v", len(resp.Mappings), resp.Mappings)
 	}
 
-	// Results should be sorted lexicographically by entity ID.
-	ids := []string{resp[0].WikidataID, resp[1].WikidataID}
-	if ids[0] != "Q100" || ids[1] != "Q200" {
-		t.Errorf("wikidata_ids = %v, want [Q100, Q200]", ids)
+	q100, ok := resp.Mappings["Q100"]
+	if !ok {
+		t.Errorf("missing Q100 in mappings = %+v", resp.Mappings)
+	} else if !slices.Contains(q100, "P4947:100") {
+		t.Errorf("Q100 mappings = %v, want P4947:100", q100)
 	}
-
-	// Each result should carry its own mappings.
-	if !slices.Contains(resp[0].Mappings, "P4947:100") {
-		t.Errorf("Q100 mappings = %v, want P4947:100", resp[0].Mappings)
-	}
-	if !slices.Contains(resp[1].Mappings, "P4947:200") {
-		t.Errorf("Q200 mappings = %v, want P4947:200", resp[1].Mappings)
+	q200, ok := resp.Mappings["Q200"]
+	if !ok {
+		t.Errorf("missing Q200 in mappings = %+v", resp.Mappings)
+	} else if !slices.Contains(q200, "P4947:200") {
+		t.Errorf("Q200 mappings = %v, want P4947:200", q200)
 	}
 }
 

@@ -4,8 +4,8 @@ import "time"
 
 // LookupResult is returned by API lookups.
 type LookupResult struct {
-	WikidataID int64
-	Mappings   []string // flat array of "P<id>:<value>" entries
+	WikidataID  int64
+	RawMappings string // canonical JSON array of "P<id>:<value>" entries
 }
 
 // HealthInfo holds lightweight health data (no expensive COUNT queries).

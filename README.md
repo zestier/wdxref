@@ -55,20 +55,19 @@ curl http://localhost:8080/v1/lookup/P345/tt0111161
 ```
 
 ```json
-[
-  {
-    "wikidata_id": "Q172241",
-    "mappings": [
+{
+  "mappings": {
+    "Q172241": [
       "P345:tt0111161",
       "P4947:278",
       "P4835:2095",
       "P8013:the-shawshank-redemption"
     ]
   }
-]
+}
 ```
 
-The response is an array of matching entities. Each entity has a `wikidata_id` and a `mappings` array of `P<id>:<value>` strings. When multiple entities claim the same external ID, all are returned. An empty array is returned when no entity matches.
+The response is an object with a `mappings` field keyed by Wikidata QID. Each value is an array of `P<id>:<value>` strings for that entity. When multiple entities claim the same external ID, all are returned as separate keys. An empty `mappings` object is returned when no entity matches.
 
 ### Lookup by Wikidata ID
 

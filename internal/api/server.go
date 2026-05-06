@@ -92,12 +92,9 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := make([]lookupResponse, len(result))
-	for i, r := range result {
-		resp[i] = lookupResponse{
-			WikidataID: fmt.Sprintf("Q%d", r.WikidataID),
-			Mappings:   r.Mappings,
-		}
+	resp := lookupResponse{Mappings: make(map[string]json.RawMessage, len(result))}
+	for _, r := range result {
+		resp.Mappings[fmt.Sprintf("Q%d", r.WikidataID)] = json.RawMessage(r.RawMappings)
 	}
 
 	w.Header().Set("Cache-Control", "public, max-age=3600")
@@ -138,8 +135,7 @@ func (s *Server) handleWikidataLookup(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	writeJSON(w, http.StatusOK, lookupResponse{
-		WikidataID: wikidataIDStr,
-		Mappings:   result.Mappings,
+		Mappings: map[string]json.RawMessage{wikidataIDStr: json.RawMessage(result.RawMappings)},
 	})
 }
 
@@ -192,8 +188,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 // Response types
 
 type lookupResponse struct {
-	WikidataID string   `json:"wikidata_id"`
-	Mappings   []string `json:"mappings"`
+	Mappings map[string]json.RawMessage `json:"mappings"`
 }
 
 type commonResponse struct {

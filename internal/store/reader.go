@@ -140,18 +140,14 @@ func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, valu
 			return nil, fmt.Errorf("parse QID from script: %w", err)
 		}
 
-		var mappings []string
-		if err := json.Unmarshal([]byte(res[i+1]), &mappings); err != nil {
-			return nil, fmt.Errorf("unmarshal entity: %w", err)
-		}
-
-		if len(mappings) == 0 {
+		raw := res[i+1]
+		if raw == "" || raw == "[]" {
 			continue
 		}
 
 		results = append(results, model.LookupResult{
-			WikidataID: qid,
-			Mappings:   mappings,
+			WikidataID:  qid,
+			RawMappings: raw,
 		})
 	}
 
@@ -183,18 +179,13 @@ func (r *Reader) lookupEntity(ctx context.Context, qid int64) (*model.LookupResu
 		return nil, fmt.Errorf("get entity: %w", err)
 	}
 
-	var mappings []string
-	if err := json.Unmarshal([]byte(mStr), &mappings); err != nil {
-		return nil, fmt.Errorf("unmarshal entity: %w", err)
-	}
-
-	if len(mappings) == 0 {
+	if mStr == "" || mStr == "[]" {
 		return nil, nil
 	}
 
 	return &model.LookupResult{
-		WikidataID: qid,
-		Mappings:   mappings,
+		WikidataID:  qid,
+		RawMappings: mStr,
 	}, nil
 }
 

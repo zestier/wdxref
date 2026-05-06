@@ -517,8 +517,8 @@ func TestProcessorWithMockServer(t *testing.T) {
 		t.Errorf("WikidataID = %d, want 172241", result.WikidataID)
 	}
 	// Check that TMDB movie mapping is present
-	if !slices.Contains(result.Mappings, "P4947:278") {
-		t.Errorf("expected P4947:278 in mappings, got %v", result.Mappings)
+	if mappings := decodeMappings(t, result); !slices.Contains(mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", mappings)
 	}
 }
 

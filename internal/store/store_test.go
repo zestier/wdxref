@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -135,6 +136,20 @@ func testLookupFirst(t *testing.T, r *Reader, property int, value string) *model
 	return &results[0]
 }
 
+// decodeMappings unmarshals the canonical raw mappings JSON returned by
+// the reader into a flat []string for assertion convenience.
+func decodeMappings(t *testing.T, result *model.LookupResult) []string {
+	t.Helper()
+	if result == nil || result.RawMappings == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(result.RawMappings), &out); err != nil {
+		t.Fatalf("decode mappings: %v", err)
+	}
+	return out
+}
+
 func TestWriterCreatesSchema(t *testing.T) {
 	_, r := newTestSetup(t)
 
@@ -164,11 +179,12 @@ func TestUpsertAndLookup(t *testing.T) {
 	if result.WikidataID != 172241 {
 		t.Errorf("WikidataID = %d, want 172241", result.WikidataID)
 	}
-	if len(result.Mappings) != 4 {
-		t.Errorf("len(Mappings) = %d, want 4", len(result.Mappings))
+	mappings := decodeMappings(t, result)
+	if len(mappings) != 4 {
+		t.Errorf("len(Mappings) = %d, want 4", len(mappings))
 	}
-	if !slices.Contains(result.Mappings, "P4947:278") {
-		t.Errorf("TMDB movie mapping missing, got %v", result.Mappings)
+	if !slices.Contains(mappings, "P4947:278") {
+		t.Errorf("TMDB movie mapping missing, got %v", mappings)
 	}
 
 	// Lookup by TMDB movie property
@@ -221,11 +237,12 @@ func TestUpsertUpdatesEntity(t *testing.T) {
 	}
 
 	result := testLookupFirst(t, r, 345, "tt0903747")
-	if len(result.Mappings) != 4 {
-		t.Errorf("len(Mappings) = %d, want 4", len(result.Mappings))
+	mappings := decodeMappings(t, result)
+	if len(mappings) != 4 {
+		t.Errorf("len(Mappings) = %d, want 4", len(mappings))
 	}
-	if !slices.Contains(result.Mappings, "P2638:169") {
-		t.Errorf("TVMaze mapping missing, got %v", result.Mappings)
+	if !slices.Contains(mappings, "P2638:169") {
+		t.Errorf("TVMaze mapping missing, got %v", mappings)
 	}
 }
 
@@ -245,10 +262,11 @@ func TestUpsertRemovesOldIDs(t *testing.T) {
 	}
 
 	result := testLookupFirst(t, r, 345, "tt0903747")
-	if len(result.Mappings) != 2 {
-		t.Errorf("len(Mappings) = %d, want 2 (tvmaze should be removed)", len(result.Mappings))
+	mappings := decodeMappings(t, result)
+	if len(mappings) != 2 {
+		t.Errorf("len(Mappings) = %d, want 2 (tvmaze should be removed)", len(mappings))
 	}
-	if slices.Contains(result.Mappings, "P2638:169") {
+	if slices.Contains(mappings, "P2638:169") {
 		t.Error("TVMaze mapping should have been removed")
 	}
 
@@ -275,8 +293,8 @@ func TestLookupByWikidataID(t *testing.T) {
 	if result.WikidataID != 172241 {
 		t.Errorf("WikidataID = %d, want 172241", result.WikidataID)
 	}
-	if len(result.Mappings) != 2 {
-		t.Errorf("len(Mappings) = %d, want 2", len(result.Mappings))
+	if mappings := decodeMappings(t, result); len(mappings) != 2 {
+		t.Errorf("len(Mappings) = %d, want 2", len(mappings))
 	}
 }
 
@@ -321,8 +339,11 @@ func TestDeleteEntityCascadesMappings(t *testing.T) {
 	}
 
 	result := testLookupFirst(t, r, 345, "tt1")
-	if result == nil || len(result.Mappings) != 3 {
-		t.Fatalf("expected 3 mappings before delete, got %+v", result)
+	if result == nil {
+		t.Fatalf("expected result before delete, got nil")
+	}
+	if mappings := decodeMappings(t, result); len(mappings) != 3 {
+		t.Fatalf("expected 3 mappings before delete, got %v", mappings)
 	}
 
 	err = testDeleteEntity(t, w, "Q1")
@@ -900,8 +921,8 @@ func TestUpsertEntitiesBatch(t *testing.T) {
 	if movie == nil || movie.WikidataID != 172241 {
 		t.Errorf("expected 172241, got %+v", movie)
 	}
-	if !slices.Contains(movie.Mappings, "P4947:278") {
-		t.Errorf("expected P4947:278 in mappings, got %v", movie.Mappings)
+	if mappings := decodeMappings(t, movie); !slices.Contains(mappings, "P4947:278") {
+		t.Errorf("expected P4947:278 in mappings, got %v", mappings)
 	}
 
 	tv := testLookupFirst(t, r, 345, "tt0903747")
@@ -941,8 +962,8 @@ func TestUpsertEntitiesBatchUpdatesExisting(t *testing.T) {
 	}
 
 	result := testLookupFirst(t, r, 345, "tt0111161")
-	if len(result.Mappings) != 2 {
-		t.Errorf("Mappings = %d, want 2", len(result.Mappings))
+	if mappings := decodeMappings(t, result); len(mappings) != 2 {
+		t.Errorf("Mappings = %d, want 2", len(mappings))
 	}
 }
 

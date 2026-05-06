@@ -53,6 +53,20 @@ func lookupFirst(t *testing.T, r *store.Reader, property int, value string) *mod
 	return &results[0]
 }
 
+// decodeMappings unmarshals a LookupResult's RawMappings into []string for
+// assertion convenience.
+func decodeMappings(t *testing.T, result *model.LookupResult) []string {
+	t.Helper()
+	if result == nil || result.RawMappings == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(result.RawMappings), &out); err != nil {
+		t.Fatalf("decode mappings: %v", err)
+	}
+	return out
+}
+
 // testWriterUpsertEntity is a test helper that wraps Pipe for convenience.
 func testWriterUpsertEntity(t *testing.T, w *store.Writer, wikidataID string, mappings []string) {
 	t.Helper()
@@ -297,8 +311,9 @@ func TestRankOrder_RoundTrip(t *testing.T) {
 
 	// Stored order must match parser output exactly.
 	want := []string{"P100:abc", "P345:tt-preferred", "P345:tt-normal", "P345:tt-deprecated"}
-	if !slices.Equal(result.Mappings, want) {
-		t.Errorf("round-trip order:\ngot  %v\nwant %v", result.Mappings, want)
+	got := decodeMappings(t, result)
+	if !slices.Equal(got, want) {
+		t.Errorf("round-trip order:\ngot  %v\nwant %v", got, want)
 	}
 }
 

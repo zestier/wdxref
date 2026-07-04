@@ -22,11 +22,15 @@ type healthResponse struct {
 	EntityCount int64  `json:"entity_count"`
 }
 
-// Handler returns an http.Handler that serves the replication endpoints:
+// Handler returns an http.Handler that serves the replication endpoints rooted
+// at /replicate:
 //
 //	GET /replicate/snapshot  — pre-generated entity snapshot (zstd line format)
 //	GET /replicate/stream    — SSE changelog stream
 //	GET /replicate/health    — replication status
+//
+// The handler always serves these paths relative to the root; to nest them
+// under a prefix (e.g. /v1) mount it with http.StripPrefix.
 func Handler(reader *store.Reader, snapshot *SnapshotGenerator, encodings []string) http.Handler {
 	mux := http.NewServeMux()
 

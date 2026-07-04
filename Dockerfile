@@ -5,36 +5,32 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
 
-FROM builder AS build-primary
+FROM builder AS build
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /primary ./cmd/primary
-
-FROM builder AS build-replicator
-ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /replicator ./cmd/replicator
-
-FROM builder AS build-replica
-ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /replica ./cmd/replica
-
-FROM builder AS build-api
-ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /api-server ./cmd/api
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /ekeid ./cmd/ekeid
 
 FROM docker.io/alpine:3.20 AS runtime
+COPY --from=build /ekeid /usr/local/bin/ekeid
+ENTRYPOINT ["ekeid"]
 
+# The single ekeid binary can run any combination of roles. The per-role targets
+# below preserve the existing one-container-per-role deployment model; each just
+# selects its role via the CMD. Roles can also be combined in a single container
+# by passing multiple roles (or setting ROLES), e.g. CMD ["primary", "replicator", "api"].
 FROM runtime AS primary
-COPY --from=build-primary /primary /usr/local/bin/primary
 CMD ["primary"]
 
 FROM runtime AS replicator
-COPY --from=build-replicator /replicator /usr/local/bin/replicator
+# The dedicated replicator image serves the replication endpoints at the legacy
+# root paths (/replicate/*) so existing replicas that point UPSTREAM_URL at the
+# host root keep working. When the replicator is combined with the api role in a
+# single container it defaults to the API namespace (/v1/replicate/*) instead,
+# letting both roles share one listen address.
+ENV REPLICATE_BASE_PATH=/
 CMD ["replicator"]
 
 FROM runtime AS replica
-COPY --from=build-replica /replica /usr/local/bin/replica
 CMD ["replica"]
 
 FROM runtime AS api
-COPY --from=build-api /api-server /usr/local/bin/api-server
-CMD ["api-server"]
+CMD ["api"]

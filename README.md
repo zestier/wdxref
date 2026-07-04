@@ -16,12 +16,14 @@ The typical use case is adding ekeid to a stack that needs fast, reliable ID rem
 
 ## Architecture
 
-ekeid consists of four single-responsibility processes that connect to a shared [Kvrocks](https://kvrocks.apache.org/) instance via TCP:
+ekeid is a single binary (`cmd/ekeid`) that can run any combination of four roles, each connecting to a shared [Kvrocks](https://kvrocks.apache.org/) instance via TCP. Roles are selected via positional arguments (e.g. `ekeid primary api`) or, when none are given, the comma-separated `ROLES` environment variable. Every enabled role runs as a goroutine sharing one Kvrocks connection and a common shutdown context, so a single process can run everything or just a subset — or you can run one role per container using the per-role Dockerfile targets.
 
-- **Primary** (`cmd/primary`) — Seeds the database from the latest Wikidata JSON dump (gzip or bzip2), then subscribes to the [Wikimedia EventStreams](https://stream.wikimedia.org/) SSE feed to process entity changes in real time. Changed entities are enqueued and fetched from the Wikidata API in batches. Failed fetches are retried automatically with backoff. All changes are appended to a Redis Stream changelog.
-- **Replicator** (`cmd/replicator`) — Reads from Kvrocks and serves replication endpoints over HTTP. Generates periodic zstd-compressed snapshots containing entity lines (`qid + raw mappings JSON`) plus a small number of JSON control lines for resumable range requests and completion handoff, and streams changelog events via SSE using the same raw payloads. Trims the changelog after a configurable retention period (default: 7 days).
-- **Replica** (`cmd/replica`) — Syncs from an upstream replicator into a local Kvrocks instance. On first run, downloads a snapshot. Then connects to the SSE changelog stream for incremental updates. Writes to the local changelog for chaining (a replica's replicator can serve another replica).
-- **API** (`cmd/api`) — A read-only HTTP server that serves lookup queries against Kvrocks. Includes CORS support, health checks, and statistics.
+- **Primary** (`primary`) — Seeds the database from the latest Wikidata JSON dump (gzip or bzip2), then subscribes to the [Wikimedia EventStreams](https://stream.wikimedia.org/) SSE feed to process entity changes in real time. Changed entities are enqueued and fetched from the Wikidata API in batches. Failed fetches are retried automatically with backoff. All changes are appended to a Redis Stream changelog.
+- **Replicator** (`replicator`) — Reads from Kvrocks and serves replication endpoints over HTTP. Generates periodic zstd-compressed snapshots containing entity lines (`qid + raw mappings JSON`) plus a small number of JSON control lines for resumable range requests and completion handoff, and streams changelog events via SSE using the same raw payloads. Trims the changelog after a configurable retention period (default: 7 days).
+- **Replica** (`replica`) — Syncs from an upstream replicator into a local Kvrocks instance. On first run, downloads a snapshot. Then connects to the SSE changelog stream for incremental updates. Writes to the local changelog for chaining (a replica's replicator can serve another replica). Mutually exclusive with the `primary` role, since both own writes to the store.
+- **API** (`api`) — A read-only HTTP server that serves lookup queries against Kvrocks. Includes CORS support, health checks, and statistics.
+
+The `replicator` and `api` roles both serve HTTP. When enabled together they share a single listen address: the API is served at the root and the replication endpoints are nested under a configurable prefix (default `/v1`, see `REPLICATE_BASE_PATH`) so their routes don't collide.
 
 ```
 Primary machine                      Replica machine
@@ -114,9 +116,11 @@ Configuration is done through environment variables:
 | Variable | Service | Default | Description |
 |---|---|---|---|
 | `CONTACT` | Primary | *(required)* | URL or email for the [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) |
+| `ROLES` | All | *(none)* | Comma-separated roles to run when none are passed as arguments (`api`, `primary`, `replica`, `replicator`) |
 | `KVROCKS_ADDR` | All | `localhost:6666` | Address of the Kvrocks instance |
 | `DUMP_FORMAT` | Primary | `gz` | Dump compression format: `gz` (~150 GB) or `bz2` (~100 GB) |
-| `LISTEN_ADDR` | API, Replicator | `:8080`, `:8081` | Address to listen on |
+| `LISTEN_ADDR` | API, Replicator | `:8080` | Address the shared HTTP server listens on |
+| `REPLICATE_BASE_PATH` | Replicator | `/v1` | Path prefix the replication endpoints are nested under; `/` (or empty) serves them at the legacy root (`/replicate/*`) |
 | `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
 | `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
 | `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |
@@ -169,11 +173,21 @@ The API will be available at `http://localhost:8080`.
 Requires Go 1.26+.
 
 ```bash
-# Build all binaries
-go build -o primary ./cmd/primary
-go build -o replicator ./cmd/replicator
-go build -o replica ./cmd/replica
-go build -o api-server ./cmd/api
+# Build the single ekeid binary
+go build -o ekeid ./cmd/ekeid
+```
+
+Select one or more roles at runtime via arguments or the `ROLES` environment variable:
+
+```bash
+# Run a single role
+./ekeid api
+
+# Combine roles in one process (api served at /, replication under /v1)
+./ekeid replicator api
+
+# Equivalent, via the environment
+ROLES=replicator,api ./ekeid
 ```
 
 ## Running Tests

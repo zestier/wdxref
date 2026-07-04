@@ -121,7 +121,7 @@ func (r *Reader) LookupByPropertyContext(ctx context.Context, property int, valu
 		return nil, ErrSchemaMismatch
 	}
 
-	res, err := lookupByPropertyScript.Run(ctx, r.rdb,
+	res, err := lookupByPropertyScript.RunRO(ctx, r.rdb,
 		[]string{propKey(property)}, value).StringSlice()
 	if err == redis.Nil {
 		return []model.LookupResult{}, nil

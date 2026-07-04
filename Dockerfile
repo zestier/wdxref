@@ -13,6 +13,13 @@ FROM docker.io/alpine:3.20 AS runtime
 COPY --from=build /ekeid /usr/local/bin/ekeid
 ENTRYPOINT ["ekeid"]
 
+# The combined ekeid image is the general-purpose entrypoint for running any
+# combination of roles in a single container. It ships no default CMD, so the
+# operator selects the roles via arguments (e.g. ["primary", "replicator", "api"])
+# or the ROLES environment variable. This is the recommended image for new
+# multi-role deployments.
+FROM runtime AS ekeid
+
 # The single ekeid binary can run any combination of roles. The per-role targets
 # below preserve the existing one-container-per-role deployment model; each just
 # selects its role via the CMD. Roles can also be combined in a single container

@@ -19,25 +19,3 @@ ENTRYPOINT ["wdxref"]
 # or the ROLES environment variable. This is the recommended image for new
 # multi-role deployments.
 FROM runtime AS wdxref
-
-# The single wdxref binary can run any combination of roles. The per-role targets
-# below preserve the existing one-container-per-role deployment model; each just
-# selects its role via the CMD. Roles can also be combined in a single container
-# by passing multiple roles (or setting ROLES), e.g. CMD ["primary", "replicator", "api"].
-FROM runtime AS primary
-CMD ["primary"]
-
-FROM runtime AS replicator
-# The dedicated replicator image serves the replication endpoints at the legacy
-# root paths (/replicate/*) so existing replicas that point UPSTREAM_URL at the
-# host root keep working. When the replicator is combined with the api role in a
-# single container it defaults to the API namespace (/v1/replicate/*) instead,
-# letting both roles share one listen address.
-ENV REPLICATE_BASE_PATH=/
-CMD ["replicator"]
-
-FROM runtime AS replica
-CMD ["replica"]
-
-FROM runtime AS api
-CMD ["api"]

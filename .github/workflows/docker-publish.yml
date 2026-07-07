@@ -20,9 +20,7 @@ jobs:
 
     strategy:
       matrix:
-        # `wdxref` is the combined multi-role image (recommended for new
-        # deployments). The per-role images are kept for backward compatibility.
-        target: [wdxref, api, primary, replicator, replica]
+        target: [wdxref]
 
     steps:
       - name: Checkout

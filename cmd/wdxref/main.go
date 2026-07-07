@@ -1,7 +1,7 @@
-// Command ekeid is a single binary capable of running any combination of the
-// ekeid roles: primary, replica, replicator, and api.
+// Command wdxref is a single binary capable of running any combination of the
+// wdxref roles: primary, replica, replicator, and api.
 //
-// Roles are selected via positional arguments (e.g. "ekeid primary api") or,
+// Roles are selected via positional arguments (e.g. "wdxref primary api") or,
 // if none are given, via the ROLES environment variable (comma-separated).
 // Every enabled role runs as a goroutine sharing a single Kvrocks connection
 // and a common shutdown context, so one process can do everything or a subset.
@@ -22,12 +22,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ekeid/ekeid/internal/api"
-	"github.com/ekeid/ekeid/internal/httpencoding"
-	"github.com/ekeid/ekeid/internal/replica"
-	"github.com/ekeid/ekeid/internal/replicate"
-	"github.com/ekeid/ekeid/internal/store"
-	"github.com/ekeid/ekeid/internal/watcher"
+	"github.com/zestier/wdxref/internal/api"
+	"github.com/zestier/wdxref/internal/httpencoding"
+	"github.com/zestier/wdxref/internal/replica"
+	"github.com/zestier/wdxref/internal/replicate"
+	"github.com/zestier/wdxref/internal/store"
+	"github.com/zestier/wdxref/internal/watcher"
 )
 
 const version = "0.1.0"
@@ -90,7 +90,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("ekeid starting", "version", version, "roles", roleList(roles), "kvrocks", kvrocksAddr)
+	slog.Info("wdxref starting", "version", version, "roles", roleList(roles), "kvrocks", kvrocksAddr)
 
 	var (
 		wg       sync.WaitGroup
@@ -136,7 +136,7 @@ func main() {
 	if firstErr != nil {
 		os.Exit(1)
 	}
-	slog.Info("ekeid stopped")
+	slog.Info("wdxref stopped")
 }
 
 // selectRoles resolves the set of roles from positional arguments, falling back

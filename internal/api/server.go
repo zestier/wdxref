@@ -11,9 +11,9 @@ import (
 
 	"github.com/goccy/go-json"
 
-	"github.com/ekeid/ekeid/internal/httpencoding"
-	"github.com/ekeid/ekeid/internal/model"
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/httpencoding"
+	"github.com/zestier/wdxref/internal/model"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 const apiReadTimeout = 5 * time.Second

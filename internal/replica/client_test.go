@@ -17,8 +17,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ekeid/ekeid/internal/replicate"
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/replicate"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 func newTestClient(t *testing.T) (*Client, *miniredis.Miniredis, *redis.Client) {

@@ -1,4 +1,4 @@
-module github.com/ekeid/ekeid
+module github.com/zestier/wdxref
 
 go 1.26.1
 

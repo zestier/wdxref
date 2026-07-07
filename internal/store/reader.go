@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekeid/ekeid/internal/model"
+	"github.com/zestier/wdxref/internal/model"
 	"github.com/redis/go-redis/v9"
 )
 

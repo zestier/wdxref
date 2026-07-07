@@ -20,7 +20,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 // testSetup creates a miniredis instance, store writer and reader for testing.

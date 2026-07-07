@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/ekeid/ekeid/internal/model"
+	"github.com/zestier/wdxref/internal/model"
 )
 
 func newTestSetup(t *testing.T) (*Writer, *Reader) {

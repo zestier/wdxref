@@ -14,7 +14,7 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 // decodedLookup is a test-only mirror of lookupResponse that decodes the

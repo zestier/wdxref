@@ -1,6 +1,6 @@
-# ekeid
+# wdxref
 
-*Pronounced "eek-id" — from the archaic "ekename" (an additional name), the word that eventually became "nickname".*
+A fast, self-hosted cache of Wikidata external-identifier cross-references (`wd` + `xref`).
 
 A self-hosted service that builds and maintains a local cache of external identifier mappings from [Wikidata](https://www.wikidata.org/). Look up any entity by one external ID (IMDb, TMDB, MusicBrainz, etc.) and get back its Wikidata QID along with all other known external IDs for that entity.
 
@@ -8,15 +8,15 @@ A self-hosted service that builds and maintains a local cache of external identi
 
 Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. If your application needs to translate between these ID systems ("given this IMDb ID, what's the TMDB ID?"), the usual options are live SPARQL queries or Wikidata API calls — both of which can be slow, rate-limited, and unpredictable under load.
 
-ekeid gives you a local, always-ready lookup service. It maintains a [Kvrocks](https://kvrocks.apache.org/) database (a Redis-compatible, disk-backed key-value store) that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API. Lookups resolve in single-digit milliseconds with no external network calls, making it suitable for user-facing applications where responsiveness matters.
+wdxref gives you a local, always-ready lookup service. It maintains a [Kvrocks](https://kvrocks.apache.org/) database (a Redis-compatible, disk-backed key-value store) that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API. Lookups resolve in single-digit milliseconds with no external network calls, making it suitable for user-facing applications where responsiveness matters.
 
-The typical use case is adding ekeid to a stack that needs fast, reliable ID remapping — for example, a media server that wants to cross-reference content across IMDb, TMDB, TVDB, and MusicBrainz without hammering upstream APIs or risking throttling during traffic spikes.
+The typical use case is adding wdxref to a stack that needs fast, reliable ID remapping — for example, a media server that wants to cross-reference content across IMDb, TMDB, TVDB, and MusicBrainz without hammering upstream APIs or risking throttling during traffic spikes.
 
 > **Planned feature:** Built-in property aliasing, so you can look up by friendly names like `imdb` or `tmdb` instead of needing to know the Wikidata property IDs (`P345`, `P4947`, etc.).
 
 ## Architecture
 
-ekeid is a single binary (`cmd/ekeid`) that can run any combination of four roles, each connecting to a shared [Kvrocks](https://kvrocks.apache.org/) instance via TCP. Roles are selected via positional arguments (e.g. `ekeid primary api`) or, when none are given, the comma-separated `ROLES` environment variable. Every enabled role runs as a goroutine sharing one Kvrocks connection and a common shutdown context, so a single process can run everything or just a subset. The recommended image for new deployments is the combined `ekeid` Dockerfile target, which ships no default roles so you select them via arguments or the `ROLES` variable. The per-role Dockerfile targets (`api`, `primary`, `replicator`, `replica`) are kept for the one-container-per-role model.
+wdxref is a single binary (`cmd/wdxref`) that can run any combination of four roles, each connecting to a shared [Kvrocks](https://kvrocks.apache.org/) instance via TCP. Roles are selected via positional arguments (e.g. `wdxref primary api`) or, when none are given, the comma-separated `ROLES` environment variable. Every enabled role runs as a goroutine sharing one Kvrocks connection and a common shutdown context, so a single process can run everything or just a subset. The recommended image for new deployments is the combined `wdxref` Dockerfile target, which ships no default roles so you select them via arguments or the `ROLES` variable. The per-role Dockerfile targets (`api`, `primary`, `replicator`, `replica`) are kept for the one-container-per-role model.
 
 - **Primary** (`primary`) — Seeds the database from the latest Wikidata JSON dump (gzip or bzip2), then subscribes to the [Wikimedia EventStreams](https://stream.wikimedia.org/) SSE feed to process entity changes in real time. Changed entities are enqueued and fetched from the Wikidata API in batches. Failed fetches are retried automatically with backoff. All changes are appended to a Redis Stream changelog.
 - **Replicator** (`replicator`) — Reads from Kvrocks and serves replication endpoints over HTTP. Generates periodic zstd-compressed snapshots containing entity lines (`qid + raw mappings JSON`) plus a small number of JSON control lines for resumable range requests and completion handoff, and streams changelog events via SSE using the same raw payloads. Trims the changelog after a configurable retention period (default: 7 days).
@@ -173,21 +173,21 @@ The API will be available at `http://localhost:8080`.
 Requires Go 1.26+.
 
 ```bash
-# Build the single ekeid binary
-go build -o ekeid ./cmd/ekeid
+# Build the single wdxref binary
+go build -o wdxref ./cmd/wdxref
 ```
 
 Select one or more roles at runtime via arguments or the `ROLES` environment variable:
 
 ```bash
 # Run a single role
-./ekeid api
+./wdxref api
 
 # Combine roles in one process (api served at /, replication under /v1)
-./ekeid replicator api
+./wdxref replicator api
 
 # Equivalent, via the environment
-ROLES=replicator,api ./ekeid
+ROLES=replicator,api ./wdxref
 ```
 
 ## Running Tests

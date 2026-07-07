@@ -20,8 +20,8 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/goccy/go-json"
 
-	"github.com/ekeid/ekeid/internal/model"
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/model"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 func newTestStoreWriter(t *testing.T) (*store.Writer, *store.Reader) {

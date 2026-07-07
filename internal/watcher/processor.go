@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 // Processor handles processing of Wikidata entity changes.

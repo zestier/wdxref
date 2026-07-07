@@ -13,7 +13,7 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 // snapshotMeta is the contents of meta.json. It points at the currently

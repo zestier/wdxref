@@ -31,7 +31,7 @@ func NewUserAgentTransport(contact string, base http.RoundTripper) *UserAgentTra
 		base = http.DefaultTransport
 	}
 	return &UserAgentTransport{
-		userAgent: "EkeidBot/0.1.0 (" + contact + ")",
+		userAgent: "WdxrefBot/0.1.0 (" + contact + ")",
 		base:      base,
 	}
 }

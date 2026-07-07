@@ -11,7 +11,7 @@ import (
 
 	"github.com/goccy/go-json"
 
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 // ClientReconnectDelay is sent to clients via the SSE `retry:` field as a

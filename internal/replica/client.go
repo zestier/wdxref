@@ -21,9 +21,9 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ekeid/ekeid/internal/httpencoding"
-	"github.com/ekeid/ekeid/internal/replicate"
-	"github.com/ekeid/ekeid/internal/store"
+	"github.com/zestier/wdxref/internal/httpencoding"
+	"github.com/zestier/wdxref/internal/replicate"
+	"github.com/zestier/wdxref/internal/store"
 )
 
 const (

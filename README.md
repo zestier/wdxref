@@ -123,6 +123,8 @@ Configuration is done through environment variables:
 | `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
 | `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
 | `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |
+| `REPLICATION_MAX_EVENTS` | Replicator | *(unbounded)* | Server-side cap on change events returned by one `/replicate/stream` request. Clients may request fewer via `?limit=`; requests are clamped to this maximum |
+| `REPLICATION_MAX_TIMEOUT` | Replicator | `15m` | Server-side cap on the total lifetime of one `/replicate/stream` request (Go duration format). Clients may request less via `?timeout=`. Set to `0` to make the stream non-blocking, effectively turning off SSE so the endpoint can run as a request/response polling API behind a load balancer |
 | `CHANGELOG_RETENTION` | Primary, Replica | `168h` | How long to retain changelog entries; `0` trims entries on every tick (effectively disabled for leaf replicas); also accepts a plain integer as hours |
 | `ENCODINGS` | API, Replica, Replicator | `zstd,gzip` | Comma-separated list of compression encodings to use; set to empty to disable compression |
 

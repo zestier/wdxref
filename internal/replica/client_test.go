@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -422,9 +423,9 @@ func TestConnectStream_UpsertEvents(t *testing.T) {
 	defer cancel()
 
 	err := c.connectStream(ctx, "0-0")
-	// Stream ends → "stream ended unexpectedly"
-	if err == nil {
-		t.Fatal("expected error on stream end")
+	// Clean EOF → errStreamClosed (a normal reconnect boundary).
+	if !errors.Is(err, errStreamClosed) {
+		t.Fatalf("expected errStreamClosed on stream end, got %v", err)
 	}
 
 	// Entities should be applied.

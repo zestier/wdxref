@@ -388,7 +388,28 @@ func setupReplicateHandler(ctx context.Context, reader *store.Reader) (http.Hand
 	slog.Info("replicator snapshot generator started", "snapshot_interval", snapshotInterval)
 
 	encodings := httpencoding.ParseEncodings(os.Getenv("ENCODINGS"))
-	return replicate.Handler(reader, snapshot, encodings), nil
+	streamLimits := replicate.DefaultStreamLimits()
+	if v := os.Getenv("REPLICATION_MAX_EVENTS"); v != "" {
+		maxEvents, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || maxEvents <= 0 {
+			return nil, fmt.Errorf("invalid REPLICATION_MAX_EVENTS %q", v)
+		}
+		streamLimits.MaxEvents = maxEvents
+	}
+	if v := os.Getenv("REPLICATION_MAX_TIMEOUT"); v != "" {
+		maxTimeout, err := time.ParseDuration(v)
+		if err != nil || maxTimeout < 0 {
+			return nil, fmt.Errorf("invalid REPLICATION_MAX_TIMEOUT %q", v)
+		}
+		streamLimits.MaxTimeout = maxTimeout
+	}
+
+	maxEventsLog := "unbounded"
+	if streamLimits.MaxEvents != replicate.DefaultMaxStreamEvents {
+		maxEventsLog = strconv.FormatInt(streamLimits.MaxEvents, 10)
+	}
+	slog.Info("replicator stream limits", "max_events", maxEventsLog, "max_timeout", streamLimits.MaxTimeout)
+	return replicate.Handler(reader, snapshot, encodings, streamLimits), nil
 }
 
 // newHTTPServer builds an http.Server whose per-request contexts derive from

@@ -31,13 +31,13 @@ type healthResponse struct {
 //
 // The handler always serves these paths relative to the root; to nest them
 // under a prefix (e.g. /v1) mount it with http.StripPrefix.
-func Handler(reader *store.Reader, snapshot *SnapshotGenerator, encodings []string) http.Handler {
+func Handler(reader *store.Reader, snapshot *SnapshotGenerator, encodings []string, limits StreamLimits) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /replicate/snapshot", snapshot.ServeSnapshot)
 
 	mux.Handle("GET /replicate/stream", httpencoding.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ServeStream(reader, w, r)
+		ServeStream(reader, w, r, limits)
 	}), encodings))
 
 	mux.Handle("GET /replicate/health", httpencoding.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

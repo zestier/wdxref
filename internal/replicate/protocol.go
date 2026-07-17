@@ -5,6 +5,7 @@ package replicate
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,11 @@ const (
 	// to stay open before the server closes it, forcing a reconnect.
 	MaxConnectionDuration = 15 * time.Minute
 
+	// DefaultMaxStreamEvents is the maximum number of events returned by one
+	// stream request when the server configuration is not overridden. It is
+	// effectively unbounded; such a request is instead bounded by its timeout.
+	DefaultMaxStreamEvents int64 = math.MaxInt64
+
 	// SnapshotFrameSize is the target number of entity lines per zstd frame in
 	// the snapshot. Each frame begins with a checkpoint control line and is
 	// independently decompressible.
@@ -47,6 +53,22 @@ const (
 	// SnapshotControlTypeDone marks the final line in the snapshot stream.
 	SnapshotControlTypeDone = "done"
 )
+
+// StreamLimits bounds one replication stream request. The event and timeout
+// limits are independent; a zero timeout means do not block for new events.
+type StreamLimits struct {
+	MaxEvents  int64
+	MaxTimeout time.Duration
+}
+
+// DefaultStreamLimits returns the default server-side bounds for stream
+// requests.
+func DefaultStreamLimits() StreamLimits {
+	return StreamLimits{
+		MaxEvents:  DefaultMaxStreamEvents,
+		MaxTimeout: MaxConnectionDuration,
+	}
+}
 
 // SnapshotLineType classifies snapshot lines before parsing.
 type SnapshotLineType int

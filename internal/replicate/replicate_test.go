@@ -128,6 +128,52 @@ func TestParseStreamIDMs(t *testing.T) {
 	}
 }
 
+func TestParseStreamRequestOptions(t *testing.T) {
+	limits := StreamLimits{MaxEvents: 100, MaxTimeout: 10 * time.Second}
+	tests := []struct {
+		name    string
+		query   string
+		want    streamRequestOptions
+		wantErr bool
+	}{
+		{name: "defaults", want: streamRequestOptions{limit: 100, timeout: 10 * time.Second}},
+		{name: "smaller values", query: "?limit=25&timeout=2s", want: streamRequestOptions{limit: 25, timeout: 2 * time.Second}},
+		{name: "clamps larger values", query: "?limit=200&timeout=20s", want: streamRequestOptions{limit: 100, timeout: 10 * time.Second}},
+		{name: "zero timeout", query: "?timeout=0s", want: streamRequestOptions{limit: 100, timeout: 0}},
+		{name: "invalid limit", query: "?limit=0", wantErr: true},
+		{name: "invalid timeout", query: "?timeout=-1s", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/replicate/stream"+tt.query, nil)
+			got, err := parseStreamRequestOptions(r, limits)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseStreamRequestOptions() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("parseStreamRequestOptions() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamReadBlock(t *testing.T) {
+	if block := streamReadBlock(context.Background(), 0); block != 0 {
+		t.Errorf("zero timeout = %v, want 0", block)
+	}
+
+	if block := streamReadBlock(context.Background(), time.Second); block != KeepAliveInterval {
+		t.Errorf("undeadlined context = %v, want %v", block, KeepAliveInterval)
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if block := streamReadBlock(ctx, time.Second); block != 0 {
+		t.Errorf("expired context = %v, want 0", block)
+	}
+}
+
 // --- checkStreamGap ---
 
 func TestCheckStreamGap(t *testing.T) {
@@ -216,7 +262,7 @@ func TestServeStream(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap, nil)
+	handler := Handler(reader, snap, nil, DefaultStreamLimits())
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -232,10 +278,29 @@ func TestServeStream(t *testing.T) {
 		}
 	})
 
+	t.Run("immediate_bounded_poll", func(t *testing.T) {
+		resp, err := http.Get(server.URL + "/replicate/stream?since=100-0&limit=1&timeout=0s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		text := string(body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", resp.StatusCode, text)
+		}
+		if strings.Count(text, "event: change") != 1 {
+			t.Errorf("change event count = %d, want 1: %s", strings.Count(text, "event: change"), text)
+		}
+		if !strings.Contains(text, "tt0111162") {
+			t.Errorf("expected event after since cursor, got: %s", text)
+		}
+	})
+
 	t.Run("reset_when_no_retained_entries", func(t *testing.T) {
 		_, reader2, _, _ := testSetup(t)
 		snap2 := NewSnapshotGenerator(reader2, t.TempDir(), time.Hour)
-		handler2 := Handler(reader2, snap2, nil)
+		handler2 := Handler(reader2, snap2, nil, DefaultStreamLimits())
 		server2 := httptest.NewServer(handler2)
 		defer server2.Close()
 
@@ -258,7 +323,7 @@ func TestServeStream(t *testing.T) {
 		}
 		reader2 := store.NewReader(c2)
 		snap2 := NewSnapshotGenerator(reader2, t.TempDir(), time.Hour)
-		handler2 := Handler(reader2, snap2, nil)
+		handler2 := Handler(reader2, snap2, nil, DefaultStreamLimits())
 		server2 := httptest.NewServer(handler2)
 		defer server2.Close()
 
@@ -309,7 +374,7 @@ func TestServeStreamEvents(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap, nil)
+	handler := Handler(reader, snap, nil, DefaultStreamLimits())
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -369,7 +434,7 @@ func TestServeStreamEvents_Zstd(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap, nil)
+	handler := Handler(reader, snap, nil, DefaultStreamLimits())
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -445,7 +510,7 @@ func TestServeStreamEvents_Gzip(t *testing.T) {
 	})
 
 	snap := NewSnapshotGenerator(reader, t.TempDir(), time.Hour)
-	handler := Handler(reader, snap, nil)
+	handler := Handler(reader, snap, nil, DefaultStreamLimits())
 	server := httptest.NewServer(handler)
 	defer server.Close()
 

@@ -38,6 +38,11 @@ const (
 // data and retries later instead of flushing immediately.
 var errUpstreamSeeding = errors.New("upstream is seeding, deferring reset")
 
+// errStreamClosed is returned by connectStream when the upstream ends the
+// stream cleanly at a bounded limit, timeout, or max connection duration.
+// This is a normal reconnect boundary, not an error.
+var errStreamClosed = errors.New("stream closed by server")
+
 // Client implements the replica state machine that syncs from an upstream
 // replicator into a local Kvrocks instance.
 type Client struct {
@@ -100,6 +105,9 @@ func (c *Client) Run(ctx context.Context) error {
 			if errors.Is(err, errUpstreamSeeding) {
 				slog.Info("replica: upstream is seeding, keeping current data and retrying later")
 				sleepWithContext(ctx, seedingRetryDelay)
+			} else if errors.Is(err, errStreamClosed) {
+				slog.Debug("replica: stream closed by server, reconnecting", "since", lastID)
+				sleepWithContext(ctx, retryBaseDelay)
 			} else {
 				slog.Error("replica: stream error, retrying", "error", err)
 				sleepWithContext(ctx, retryBaseDelay)
@@ -453,7 +461,9 @@ func (c *Client) connectStream(ctx context.Context, since string) error {
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan stream: %w", err)
 	}
-	return fmt.Errorf("stream ended unexpectedly")
+	// Clean EOF: the server closed the stream at a bounded limit or timeout
+	// (or the max connection duration). This is a normal reconnect boundary.
+	return errStreamClosed
 }
 
 func openStreamBody(resp *http.Response) (io.ReadCloser, error) {

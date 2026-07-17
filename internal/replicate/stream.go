@@ -1,6 +1,7 @@
 package replicate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,6 +49,72 @@ func resolveStreamCursor(r *http.Request) string {
 	return "0"
 }
 
+type streamRequestOptions struct {
+	limit   int64
+	timeout time.Duration
+}
+
+func parseStreamRequestOptions(r *http.Request, limits StreamLimits) (streamRequestOptions, error) {
+	if limits.MaxEvents <= 0 {
+		return streamRequestOptions{}, fmt.Errorf("max stream events must be positive")
+	}
+	if limits.MaxTimeout < 0 {
+		return streamRequestOptions{}, fmt.Errorf("max stream timeout must not be negative")
+	}
+
+	options := streamRequestOptions{
+		limit:   limits.MaxEvents,
+		timeout: limits.MaxTimeout,
+	}
+	query := r.URL.Query()
+
+	if raw := query.Get("limit"); raw != "" {
+		requested, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || requested <= 0 {
+			return streamRequestOptions{}, fmt.Errorf("invalid limit %q", raw)
+		}
+		if requested < options.limit {
+			options.limit = requested
+		}
+	}
+
+	if raw, present := query["timeout"]; present {
+		if len(raw) != 1 || raw[0] == "" {
+			return streamRequestOptions{}, fmt.Errorf("invalid timeout")
+		}
+		requested, err := time.ParseDuration(raw[0])
+		if err != nil || requested < 0 {
+			return streamRequestOptions{}, fmt.Errorf("invalid timeout %q", raw[0])
+		}
+		if requested < options.timeout {
+			options.timeout = requested
+		}
+	}
+
+	return options, nil
+}
+
+// streamReadBlock returns the maximum blocking duration for the next changelog
+// read. A zero timeout means read without blocking. Otherwise it blocks for at
+// most KeepAliveInterval, capped by the request's remaining deadline.
+func streamReadBlock(ctx context.Context, timeout time.Duration) time.Duration {
+	if timeout == 0 {
+		return 0
+	}
+
+	block := KeepAliveInterval
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+		if remaining < block {
+			block = remaining
+		}
+	}
+	return block
+}
+
 // ServeStream handles GET /replicate/stream as an SSE endpoint compatible
 // with the W3C EventSource specification. The client identifies its current
 // position via either the `since` query parameter or the standard
@@ -56,7 +123,16 @@ func resolveStreamCursor(r *http.Request) string {
 // blocks for live changes. If coverage cannot be proven (no retained
 // entries, or position older than the oldest retained entry), it sends an
 // "event: reset" and closes the connection.
-func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
+//
+// The limits argument bounds the request; clients may request tighter bounds
+// via the `limit` and `timeout` query parameters (see StreamLimits).
+func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request, limits StreamLimits) {
+	options, err := parseStreamRequestOptions(r, limits)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	since := resolveStreamCursor(r)
 
 	flusher, ok := w.(http.Flusher)
@@ -99,30 +175,38 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+	if options.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.timeout)
+		defer cancel()
+	}
 	cursor := since
-	deadline := time.After(MaxConnectionDuration)
+	eventsSent := int64(0)
 
-	for {
-		select {
-		case <-ctx.Done():
+	for eventsSent < options.limit {
+		if ctx.Err() != nil {
 			return
-		case <-deadline:
-			// Force reconnect, like Wikimedia EventStreams.
-			return
-		default:
 		}
 
-		events, err := reader.StreamRead(ctx, cursor, StreamReadCount, KeepAliveInterval)
+		count := int64(StreamReadCount)
+		if remaining := options.limit - eventsSent; remaining < count {
+			count = remaining
+		}
+		events, err := reader.StreamRead(ctx, cursor, count, streamReadBlock(ctx, options.timeout))
 		if err != nil {
-			if ctx.Err() != nil {
-				return
+			if ctx.Err() == nil {
+				slog.Error("stream: read error", "error", err)
 			}
-			slog.Error("stream: read error", "error", err)
 			return
 		}
 
 		if len(events) == 0 {
-			// Timeout with no events — send keepalive.
+			// A non-blocking poll (timeout=0) or an expired deadline has
+			// nothing more to send, so close cleanly.
+			if options.timeout == 0 || ctx.Err() != nil {
+				return
+			}
+			// Blocked read timed out with no events — send a keepalive.
 			fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
 			continue
@@ -133,6 +217,7 @@ func ServeStream(reader *store.Reader, w http.ResponseWriter, r *http.Request) {
 			// resume automatically via Last-Event-ID after a disconnect.
 			fmt.Fprintf(w, "id: %s\nevent: change\ndata: %s\n\n", ev.ID, FormatStreamChangeData(ev.QID, ev.RawMappings))
 			cursor = ev.ID
+			eventsSent++
 		}
 		flusher.Flush()
 	}

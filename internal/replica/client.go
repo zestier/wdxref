@@ -30,6 +30,7 @@ const (
 	retryBaseDelay    = 1 * time.Second
 	retryMaxDelay     = 60 * time.Second
 	seedingRetryDelay = 30 * time.Second
+	replicatePath     = "/v1/replicate"
 )
 
 // errUpstreamSeeding is returned by connectStream when the upstream
@@ -113,7 +114,7 @@ func (c *Client) Run(ctx context.Context) error {
 // lines at zstd frame boundaries and a final done control line. Resume uses
 // standard HTTP Range and If-Range over the raw compressed bytes.
 func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
-	url := c.upstreamURL + "/replicate/snapshot"
+	url := c.upstreamURL + replicatePath + "/snapshot"
 
 	// Check for in-progress snapshot state from a previous attempt.
 	prev, _ := c.reader.GetSyncStates("snapshot_etag", "snapshot_resume_offset", "snapshot_resume_entities", "snapshot_entities_applied")
@@ -327,7 +328,7 @@ func (c *Client) fetchSnapshot(ctx context.Context) (string, error) {
 
 // connectStream connects to the upstream SSE stream and applies changes.
 func (c *Client) connectStream(ctx context.Context, since string) error {
-	url := fmt.Sprintf("%s/replicate/stream?since=%s", c.upstreamURL, since)
+	url := fmt.Sprintf("%s%s/stream?since=%s", c.upstreamURL, replicatePath, since)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)

@@ -23,7 +23,7 @@ wdxref is a single binary (`cmd/wdxref`) that can run any combination of four ro
 - **Replica** (`replica`) — Syncs from an upstream replicator into a local Kvrocks instance. On first run, downloads a snapshot. Then connects to the SSE changelog stream for incremental updates. Writes to the local changelog for chaining (a replica's replicator can serve another replica). Mutually exclusive with the `primary` role, since both own writes to the store.
 - **API** (`api`) — A read-only HTTP server that serves lookup queries against Kvrocks. Includes CORS support, health checks, and statistics.
 
-The `replicator` and `api` roles both serve HTTP. When enabled together they share a single listen address: the API is served at the root and the replication endpoints are nested under a configurable prefix (default `/v1`, see `REPLICATE_BASE_PATH`) so their routes don't collide.
+The `replicator` and `api` roles both serve HTTP. When enabled together they share a single listen address: the API is served at the root and the replication endpoints are nested under the fixed `/v1/replicate` path so their routes don't collide.
 
 ```
 Primary machine                      Replica machine
@@ -120,7 +120,6 @@ Configuration is done through environment variables:
 | `KVROCKS_ADDR` | All | `localhost:6666` | Address of the Kvrocks instance |
 | `DUMP_FORMAT` | Primary | `gz` | Dump compression format: `gz` (~150 GB) or `bz2` (~100 GB) |
 | `LISTEN_ADDR` | API, Replicator | `:8080` | Address the shared HTTP server listens on |
-| `REPLICATE_BASE_PATH` | Replicator | `/v1` | Path prefix the replication endpoints are nested under; `/` (or empty) serves them at the legacy root (`/replicate/*`) |
 | `UPSTREAM_URL` | Replica | *(required)* | URL of the upstream replicator (e.g. `http://primary-replicator:8081`) |
 | `SNAPSHOT_DIR` | Replicator | `/data/snapshots` | Directory for snapshot files |
 | `SNAPSHOT_INTERVAL` | Replicator | `24h` | How often to regenerate the snapshot (Go duration format) |

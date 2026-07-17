@@ -40,39 +40,6 @@ func TestWithWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestReplicatePrefix(t *testing.T) {
-	cases := []struct {
-		name string
-		set  bool
-		val  string
-		want string
-	}{
-		{name: "unset defaults to /v1", set: false, want: "/v1"},
-		{name: "empty is root", set: true, val: "", want: ""},
-		{name: "slash is root", set: true, val: "/", want: ""},
-		{name: "blank is root", set: true, val: "  ", want: ""},
-		{name: "bare segment", set: true, val: "v1", want: "/v1"},
-		{name: "leading slash", set: true, val: "/v1", want: "/v1"},
-		{name: "trailing slash", set: true, val: "/v1/", want: "/v1"},
-		{name: "nested", set: true, val: "/api/v1", want: "/api/v1"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.set {
-				t.Setenv("REPLICATE_BASE_PATH", tc.val)
-			} else {
-				// t.Setenv can't unset, so guard against a value leaking in
-				// from the environment the test runs in.
-				t.Setenv("REPLICATE_BASE_PATH", "/v1")
-			}
-			if got := replicatePrefix(); got != tc.want {
-				t.Errorf("replicatePrefix() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 // pathSpy records the request path its inner mux dispatched to, so we can
 // assert that mountReplicate hands the replication handler the paths it expects
 // (i.e. that any prefix has been stripped).
@@ -87,26 +54,10 @@ func pathSpy() (http.Handler, *string) {
 }
 
 func TestMountReplicate(t *testing.T) {
-	t.Run("root prefix serves legacy path", func(t *testing.T) {
+	t.Run("fixed v1 path strips before dispatch", func(t *testing.T) {
 		mux := http.NewServeMux()
 		spy, seen := pathSpy()
-		mountReplicate(mux, "", spy)
-
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/replicate/health", nil))
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rec.Code)
-		}
-		if *seen != "/replicate/health" {
-			t.Errorf("handler saw %q, want /replicate/health", *seen)
-		}
-	})
-
-	t.Run("prefix nests and strips before dispatch", func(t *testing.T) {
-		mux := http.NewServeMux()
-		spy, seen := pathSpy()
-		mountReplicate(mux, "/v1", spy)
+		mountReplicate(mux, spy)
 
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/replicate/health", nil))
@@ -119,10 +70,10 @@ func TestMountReplicate(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy path 404s when nested under prefix", func(t *testing.T) {
+	t.Run("legacy path 404s", func(t *testing.T) {
 		mux := http.NewServeMux()
 		spy, _ := pathSpy()
-		mountReplicate(mux, "/v1", spy)
+		mountReplicate(mux, spy)
 
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/replicate/health", nil))
@@ -138,8 +89,6 @@ func TestMountReplicate(t *testing.T) {
 // as the root catch-all — requests are dispatched to the right handler and the
 // catch-all does not shadow the replication subtree.
 func TestCombinedRouting(t *testing.T) {
-	const prefix = "/v1"
-
 	// apiSpy stands in for the API handler mounted at "/"; it records the path
 	// it received and reports which handler served the request.
 	apiSeen := new(string)
@@ -152,7 +101,7 @@ func TestCombinedRouting(t *testing.T) {
 	replSpy, replSeen := pathSpy()
 
 	mux := http.NewServeMux()
-	mountReplicate(mux, prefix, replSpy)
+	mountReplicate(mux, replSpy)
 	mux.Handle("/", apiSpy)
 
 	cases := []struct {

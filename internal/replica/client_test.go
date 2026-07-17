@@ -314,7 +314,7 @@ func TestFetchSnapshot_Success(t *testing.T) {
 	body := buildZstdSnapshot(t, entities, "500-0")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/replicate/snapshot" {
+		if r.URL.Path != "/v1/replicate/snapshot" {
 			http.Error(w, "not found", 404)
 			return
 		}

@@ -124,8 +124,8 @@ func main() {
 
 	// The replicator and API are the two HTTP roles. When they resolve to the
 	// same listen address they are served from a single http.Server with the
-	// replication endpoints nested under the configured base path (default
-	// /v1), so one port can serve both without the routes colliding.
+	// replication endpoints nested under /v1, so one port can serve both without
+	// the routes colliding.
 	if err := startHTTPRoles(ctx, reader, has(roleReplicator), has(roleAPI), run); err != nil {
 		slog.Error("failed to start HTTP roles", "error", err)
 		os.Exit(1)
@@ -266,7 +266,7 @@ func runReplica(ctx context.Context, client *store.Client, writer *store.Writer,
 // startHTTPRoles serves the replicator and/or API roles on a single
 // http.Server bound to LISTEN_ADDR (default :8080). When both are enabled they
 // share the one address: the API is served at / and the replication endpoints
-// are nested under their prefix (default /v1) so the routes don't collide.
+// are nested under /v1 so the routes don't collide.
 // Running the two roles on separate ports is intentionally out of scope — use
 // separate processes for that.
 func startHTTPRoles(ctx context.Context, reader *store.Reader, replicator, api bool, run func(string, func(context.Context) error)) error {
@@ -293,8 +293,7 @@ func startHTTPRoles(ctx context.Context, reader *store.Reader, replicator, api b
 }
 
 // buildHTTPHandler assembles the combined handler for the enabled HTTP roles:
-// the replication endpoints (nested under replicatePrefix) and/or the API at
-// the root.
+// the replication endpoints (nested under /v1) and/or the API at the root.
 func buildHTTPHandler(ctx context.Context, reader *store.Reader, replicator, api bool) (http.Handler, error) {
 	mux := http.NewServeMux()
 
@@ -303,9 +302,8 @@ func buildHTTPHandler(ctx context.Context, reader *store.Reader, replicator, api
 		if err != nil {
 			return nil, err
 		}
-		prefix := replicatePrefix()
-		mountReplicate(mux, prefix, replHandler)
-		slog.Info("replicator enabled", "replicate_path", prefix+"/replicate")
+		mountReplicate(mux, replHandler)
+		slog.Info("replicator enabled", "replicate_path", "/v1/replicate")
 	}
 
 	if api {
@@ -319,32 +317,10 @@ func buildHTTPHandler(ctx context.Context, reader *store.Reader, replicator, api
 	return mux, nil
 }
 
-// mountReplicate mounts a replication handler (which serves /replicate/*) under
-// prefix. An empty prefix keeps the legacy root paths; a prefix like /v1 nests
-// them and strips it back off before dispatching to the handler.
-func mountReplicate(mux *http.ServeMux, prefix string, replHandler http.Handler) {
-	if prefix == "" {
-		mux.Handle("/replicate/", replHandler)
-		return
-	}
-	mux.Handle(prefix+"/replicate/", http.StripPrefix(prefix, replHandler))
-}
-
-// replicatePrefix resolves the path prefix the replication endpoints are nested
-// under. It defaults to the API namespace (/v1) so the API and replicator can
-// share a port out of the box. REPLICATE_BASE_PATH overrides it, with "/" (or
-// empty) selecting the legacy root paths that the dedicated replicator image
-// uses for compatibility with existing replicas.
-func replicatePrefix() string {
-	v, ok := os.LookupEnv("REPLICATE_BASE_PATH")
-	if !ok {
-		return "/v1"
-	}
-	v = strings.Trim(strings.TrimSpace(v), "/")
-	if v == "" {
-		return ""
-	}
-	return "/" + v
+// mountReplicate mounts the replication handler (which serves /replicate/*)
+// under the fixed /v1 namespace.
+func mountReplicate(mux *http.ServeMux, replHandler http.Handler) {
+	mux.Handle("/v1/replicate/", http.StripPrefix("/v1", replHandler))
 }
 
 // httpRoleName labels the HTTP server for logging based on which roles it hosts.
